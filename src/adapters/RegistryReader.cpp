@@ -107,6 +107,44 @@ void readPerDeviceFamily(HKEY root, const wchar_t* path, SourceTier tier,
     });
 }
 
+// —— 键族描述表：三类结构 ①每设备子键族 ②单键品牌缓存 ——
+// 字段序 {path, [tier|label], pct, chg, time, name, requireValid}
+struct FamilySpec {
+    const wchar_t* path; SourceTier tier;
+    const wchar_t* pct, *chg, *time, *name; bool valid;
+};
+const FamilySpec kFamilies[] = {
+    // 1) DeviceState<sanitized> — 最可信（写入时已做 0-100 校验）
+    {L"DeviceState",       SourceTier::DeviceState, L"BatteryPercent", L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    // 2) CustomDevices<deviceId> — CachedBattery(-1=未知)、LastSeen
+    {L"CustomDevices",     SourceTier::PerDevice,   L"CachedBattery",  nullptr,       L"LastSeen",    L"DeviceName", false},
+    // 3) HardwareCache<deviceId>（雷蛇混合结构的每设备子键）
+    {L"HardwareCache",     SourceTier::PerDevice,   L"BatteryPercent", nullptr,       L"LastUpdated", L"DeviceName", false},
+    // 4) MchoseCache\Z75S\<HEX>（每端点子键）
+    {L"MchoseCache\\Z75S", SourceTier::PerDevice,   L"BatteryPercent", L"IsCharging", L"LastUpdated", L"DeviceName", false},
+};
+
+struct SingleSpec {
+    const wchar_t* path, *label, *pct, *chg, *time, *name; bool valid;
+};
+const SingleSpec kSingles[] = {
+    {L"HardwareCache",      L"Razer",           L"BatteryPercent",   nullptr,       L"LastUpdated", L"DeviceName", false}, // 根值=旧版单设备遗留
+    {L"AcerCache",          L"Acer",            L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    {L"HyperXCache",        L"HyperX",          L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    {L"LogitechCache",      L"Logitech",        L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", true }, // 需 IsValid=1
+    {L"MchoseCache",        L"Mchose",          L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    {L"MchoseCache",        L"Mchose G75",      L"G75BatteryPercent",L"G75IsCharging", L"G75LastUpdated", L"DeviceName", false},
+    {L"MchoseMouseCache",   L"Mchose Mouse",    L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", true }, // 需 IsValid=1
+    {L"NuphyCache",         L"Nuphy",           L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    {L"RapooCache",         L"Rapoo",           L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    {L"SteelSeriesCache",   L"SteelSeries",     L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    {L"VgnCache",           L"VGN",             L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", true }, // 需 IsValid=1
+    {L"VgnKeyboardCache",   L"VGN Keyboard",    L"BatteryPercent",   L"IsCharging", L"LastUpdated", L"DeviceName", false},
+    // Valkyrie：键鼠分列（同键两套值）
+    {L"ValkyrieCache",      L"Valkyrie Keyboard", L"KbBatteryPercent",   nullptr, L"LastUpdated", L"KbDeviceName",   false},
+    {L"ValkyrieCache",      L"Valkyrie Mouse",    L"MouseBatteryPercent",nullptr, L"LastUpdated", L"MouseDeviceName", false},
+};
+
 } // namespace
 
 Snapshot ReadRegistrySnapshot() {
@@ -115,54 +153,11 @@ Snapshot ReadRegistrySnapshot() {
     if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\RazerBatteryTray", 0, KEY_READ, &root) != ERROR_SUCCESS)
         return snap;
 
-    // —— 每设备子键（三类结构之 ①）——
-    // 1) DeviceState<sanitized>  —— 最可信（写入时已做 0-100 校验）
-    readPerDeviceFamily(root, L"DeviceState", SourceTier::DeviceState,
-                        L"BatteryPercent", L"IsCharging", L"LastUpdated", L"DeviceName",
-                        false, snap.readings);
-    // 2) CustomDevices<deviceId>  —— CachedBattery(-1=未知)、LastSeen
-    readPerDeviceFamily(root, L"CustomDevices", SourceTier::PerDevice,
-                        L"CachedBattery", nullptr, L"LastSeen", L"DeviceName",
-                        false, snap.readings);
-    // 3) HardwareCache\<deviceId>（雷蛇混合结构的每设备子键）
-    readPerDeviceFamily(root, L"HardwareCache", SourceTier::PerDevice,
-                        L"BatteryPercent", nullptr, L"LastUpdated", L"DeviceName",
-                        false, snap.readings);
-    // 4) MchoseCache\Z75S\<HEX>（每端点子键）
-    readPerDeviceFamily(root, L"MchoseCache\\Z75S", SourceTier::PerDevice,
-                        L"BatteryPercent", L"IsCharging", L"LastUpdated", L"DeviceName",
-                        false, snap.readings);
-
-    // —— 单键品牌缓存（三类结构之 ②，13 族；Apple/UniversalGaming 为死常量，跳过）——
-    readSingleKey(root, L"HardwareCache", L"Razer", L"BatteryPercent", nullptr, L"LastUpdated",
-                  L"DeviceName", false, snap.readings); // 根值=旧版单设备遗留
-    readSingleKey(root, L"AcerCache", L"Acer", L"BatteryPercent", L"IsCharging", L"LastUpdated",
-                  L"DeviceName", false, snap.readings);
-    readSingleKey(root, L"HyperXCache", L"HyperX", L"BatteryPercent", L"IsCharging", L"LastUpdated",
-                  L"DeviceName", false, snap.readings);
-    readSingleKey(root, L"LogitechCache", L"Logitech", L"BatteryPercent", L"IsCharging", L"LastUpdated",
-                  L"DeviceName", true, snap.readings); // 需 IsValid=1
-    readSingleKey(root, L"MchoseCache", L"Mchose", L"BatteryPercent", L"IsCharging", L"LastUpdated",
-                  L"DeviceName", false, snap.readings);
-    readSingleKey(root, L"MchoseCache", L"Mchose G75", L"G75BatteryPercent", L"G75IsCharging",
-                  L"G75LastUpdated", L"DeviceName", false, snap.readings);
-    readSingleKey(root, L"MchoseMouseCache", L"Mchose Mouse", L"BatteryPercent", L"IsCharging",
-                  L"LastUpdated", L"DeviceName", true, snap.readings); // 需 IsValid=1
-    readSingleKey(root, L"NuphyCache", L"Nuphy", L"BatteryPercent", L"IsCharging", L"LastUpdated",
-                  L"DeviceName", false, snap.readings);
-    readSingleKey(root, L"RapooCache", L"Rapoo", L"BatteryPercent", L"IsCharging", L"LastUpdated",
-                  L"DeviceName", false, snap.readings);
-    readSingleKey(root, L"SteelSeriesCache", L"SteelSeries", L"BatteryPercent", L"IsCharging",
-                  L"LastUpdated", L"DeviceName", false, snap.readings);
-    readSingleKey(root, L"VgnCache", L"VGN", L"BatteryPercent", L"IsCharging", L"LastUpdated",
-                  L"DeviceName", true, snap.readings); // 需 IsValid=1
-    readSingleKey(root, L"VgnKeyboardCache", L"VGN Keyboard", L"BatteryPercent", L"IsCharging",
-                  L"LastUpdated", L"DeviceName", false, snap.readings);
-    // Valkyrie：键鼠分列（同键两套值）
-    readSingleKey(root, L"ValkyrieCache", L"Valkyrie Keyboard", L"KbBatteryPercent", nullptr,
-                  L"LastUpdated", L"KbDeviceName", false, snap.readings);
-    readSingleKey(root, L"ValkyrieCache", L"Valkyrie Mouse", L"MouseBatteryPercent", nullptr,
-                  L"LastUpdated", L"MouseDeviceName", false, snap.readings);
+    // —— 三类结构 ①每设备子键族 + ②单键品牌缓存：按表遍历（表定义见匿名命名空间）——
+    for (const auto& f : kFamilies)
+        readPerDeviceFamily(root, f.path, f.tier, f.pct, f.chg, f.time, f.name, f.valid, snap.readings);
+    for (const auto& s : kSingles)
+        readSingleKey(root, s.path, s.label, s.pct, s.chg, s.time, s.name, s.valid, snap.readings);
 
     // —— 单键值名=设备ID（三类结构之 ③）——
     // RazerHeadsetCache：值="电量|充电|Ticks" 字符串

@@ -1,3 +1,26 @@
+# ===== 构建产物（build.ps1 生成，不上传） =====
 bin/
-capsule.config.json
 *.obj
+*.o
+*.a
+*.lib
+*.exe
+*.dll
+
+# ===== 本机运行时文件（含个人信息/本地配置） =====
+capsule.config.json
+*.log
+
+# ===== 排查用诊断截图（上传前生成，临时产物） =====
+/*.png
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+*.suo
+*.user
+
+# ===== 系统文件 =====
+Thumbs.db
+desktop.ini
+.DS_Store
