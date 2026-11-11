@@ -23,6 +23,8 @@ static int g_capsuleW = 240, g_capsuleH = 32;
 static int g_x = -10000, g_y = -10000;
 // 内容命中盒（屏幕坐标窗口内相对值）：盒外 WM_NCHITTEST 返回 HTTRANSPARENT，点击落到下层任务栏图标
 static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
+// z序守护钩子（前台/窗口重排事件 → 即时重申置顶，见 ensureTopmost）
+static HWINEVENTHOOK g_hookFg = nullptr, g_hookRe = nullptr;
 static ULONG_PTR g_gdiplusToken = 0;
 
 enum { IDT_POLL = 1, IDT_LIFE = 2 };
@@ -277,6 +279,35 @@ cfg:
     sampleNow(); // applyPollTimer 生效新档位
 }
 
+// ── z序守护 ──────────────────────────────────────────────────────
+// explorer 在任务栏交互（点击图标/托盘气泡/开始菜单）时会重排 topmost 层，把胶囊
+// 压回任务栏下方 → 表现为“点任务栏胶囊突然消失，2s 后又出现”。
+// 订阅前台/窗口重排事件，在被压住的瞬间立即重申置顶；仅当 z 链上真的查到任务栏
+// 高于自己才 SetWindowPos，避免自身重排再触发回调造成循环。
+static bool capsuleBelowTray() {
+    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!tray) return false;
+    HWND h = g_hwnd;
+    for (int i = 0; i < 64 && h; ++i) {
+        h = GetWindow(h, GW_HWNDPREV); // prev = 在 Z 序中高于自己的窗口
+        if (h == tray) return true;
+    }
+    return false;
+}
+
+static void ensureTopmost() {
+    if (!g_hwnd || !IsWindowVisible(g_hwnd) || !capsuleBelowTray()) return;
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+static void CALLBACK onZEvent(HWINEVENTHOOK, DWORD, HWND, LONG idObject, LONG, DWORD, DWORD) {
+    // 实测 explorer 重排事件 idObject 可能是 OBJID_CLIENT(-4) 等，不按对象过滤；
+    // ensureTopmost 内部自带“真的被压住才动手”的判定，回调本身零开销。
+    (void)idObject;
+    ensureTopmost();
+}
+
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_NCHITTEST: {
@@ -329,6 +360,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             KillTimer(hwnd, IDT_POLL);
             KillTimer(hwnd, IDT_LIFE);
+            if (g_hookFg) UnhookWinEvent(g_hookFg);
+            if (g_hookRe) UnhookWinEvent(g_hookRe);
             PostQuitMessage(0);
             return 0;
     }
@@ -367,6 +400,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     sampleNow(); // 首采：决定是否显示
     SetTimer(g_hwnd, IDT_LIFE, 2000, nullptr);
+
+    // z序守护：被任务栏重排压下时立即（毫秒级）拉回，2s LIFE 仅作兜底
+    g_hookFg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                               nullptr, onZEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+    g_hookRe = SetWinEventHook(EVENT_OBJECT_REORDER, EVENT_OBJECT_REORDER,
+                               nullptr, onZEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
