@@ -75,6 +75,12 @@ DeviceReading readDeviceValues(HKEY sub, const std::wstring& keyName, SourceTier
     r.timestamp = readTimestamp(sub, timeName);
     std::wstring dn;
     if (nameName && readSz(sub, nameName, dn)) r.displayName = toUtf8(dn);
+    // 通用名字回退链：CustomDevices 等键族无 DeviceName，真实名字在 CustomName/OriginalName
+    if (r.displayName.empty() && readSz(sub, L"CustomName", dn) && !dn.empty()) {
+        r.displayName = toUtf8(dn);
+    } else if (r.displayName.empty() && readSz(sub, L"OriginalName", dn) && !dn.empty()) {
+        r.displayName = toUtf8(dn);
+    }
     if (requireValid) { r.validFlag = readDword(sub, L"IsValid", v) && v == 1; }
     return r;
 }

@@ -21,6 +21,8 @@ static Snapshot g_snap;
 static ViewModel g_vm;
 static int g_capsuleW = 240, g_capsuleH = 32;
 static int g_x = -10000, g_y = -10000;
+// 内容命中盒（屏幕坐标窗口内相对值）：盒外 WM_NCHITTEST 返回 HTTRANSPARENT，点击落到下层任务栏图标
+static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
 static ULONG_PTR g_gdiplusToken = 0;
 
 enum { IDT_POLL = 1, IDT_LIFE = 2 };
@@ -65,20 +67,18 @@ static int measureWidth() {
     {
         HDC screen = GetDC(nullptr);
         HDC mem = CreateCompatibleDC(screen);
-        Gdiplus::RectF re, rn, rp;
+        Gdiplus::RectF rn, rp;
         {
             Gdiplus::Graphics gr(mem);
             gr.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-            Gdiplus::Font fEmoji(L"Segoe UI Emoji", 10.0f);
             Gdiplus::Font fName(L"Segoe UI", 9.5f);
             Gdiplus::Font fPct(L"Segoe UI", 9.5f, Gdiplus::FontStyleBold);
-            gr.MeasureString(L"⚡", -1, &fEmoji, Gdiplus::PointF(0, 0), &re);
             gr.MeasureString(name.c_str(), -1, &fName, Gdiplus::PointF(0, 0), &rn);
             gr.MeasureString(pct, -1, &fPct, Gdiplus::PointF(0, 0), &rp);
         } // gr 先析构
         DeleteDC(mem);
         ReleaseDC(nullptr, screen);
-        w = 12 + (int)re.Width + 4 + (int)rn.Width + 10 + 76 + 6 + (int)rp.Width + 12;
+        w = 12 + (int)rn.Width + 10 + 76 + 6 + (int)rp.Width + 12;
     }
     if (w < 160) w = 160;
     if (w > 420) w = 420; // 极端长名防溢出（名字另有 24 字符截断）
@@ -119,35 +119,24 @@ static void render() {
     gr.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
     gr.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
-    const float r = H / 2.0f; // 胶囊形
-    Gdiplus::GraphicsPath bg;
-    roundRectPath(bg, 0.5f, 0.5f, (float)W - 1, (float)H - 1, r - 0.5f);
-    Gdiplus::SolidBrush bgBrush(Gdiplus::Color(0xD8, 0xFF, 0xFF, 0xFF)); // 半透明白
-    gr.FillPath(&bgBrush, &bg);
-    Gdiplus::Pen edge(Gdiplus::Color(0x4D, 0xFF, 0xFF, 0xFF), 1.0f);
-    gr.DrawPath(&edge, &bg);
-
-    Gdiplus::Font fEmoji(L"Segoe UI Emoji", 10.0f);
+    // 背景完全透明（无底板/描边）——仅绘制文字与进度条，
+    // 让胶囊下方任务栏图标透出；文字加白色描边保证图标底上可读。
     Gdiplus::Font fName(L"Segoe UI", 9.5f);
     Gdiplus::Font fPct(L"Segoe UI", 9.5f, Gdiplus::FontStyleBold);
     Gdiplus::SolidBrush textBr(Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
+    Gdiplus::SolidBrush outlineBr(Gdiplus::Color(0xD0, 0xFF, 0xFF, 0xFF));
     Gdiplus::SolidBrush pctBr(g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xD7, 0x00, 0x15)
                                               : Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
 
     float y = (H - 16.0f) / 2.0f;
     float x = 12.0f;
 
-    // 闪电
-    Gdiplus::RectF re;
-    gr.MeasureString(L"⚡", -1, &fEmoji, Gdiplus::PointF(0, 0), &re);
-    gr.DrawString(L"⚡", -1, &fEmoji, Gdiplus::PointF(x, y - 2.0f), &textBr);
-    x += re.Width + 4.0f;
-
-    // 设备名
+    // 设备名（白色描边 + 正文）
     std::wstring name = utf8ToWide(g_vm.displayName);
     if (name.empty()) name = L"--";
     Gdiplus::RectF rn;
     gr.MeasureString(name.c_str(), -1, &fName, Gdiplus::PointF(0, 0), &rn);
+    gr.DrawString(name.c_str(), -1, &fName, Gdiplus::PointF(x + 1.0f, y + 1.0f), &outlineBr);
     gr.DrawString(name.c_str(), -1, &fName, Gdiplus::PointF(x, y), &textBr);
     x += rn.Width + 10.0f;
 
@@ -179,7 +168,14 @@ static void render() {
     swprintf(pct, 16, L"%d%%", g_vm.percent);
     Gdiplus::RectF rp;
     gr.MeasureString(pct, -1, &fPct, Gdiplus::PointF(0, 0), &rp);
+    gr.DrawString(pct, -1, &fPct, Gdiplus::PointF(x + 1.0f, y + 1.0f), &outlineBr);
     gr.DrawString(pct, -1, &fPct, Gdiplus::PointF(x, y), &pctBr);
+
+    // 内容命中盒：盒外点击穿透到任务栏（透明像素不吞点击）
+    g_hitL = 12;
+    g_hitR = (int)(x + rp.Width);
+    g_hitT = (int)y;
+    g_hitB = (int)y + 16;
 
     gr.Flush();
 
@@ -191,7 +187,9 @@ static void render() {
     POINT ptSrc{0, 0};
     POINT ptDst{g_x, g_y};
     SIZE sz{W, H};
-    BLENDFUNCTION bf{AC_SRC_ALPHA, ULW_ALPHA, 255, 0};
+    // 字段序：{BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat}
+    // AlphaFormat 必须 = AC_SRC_ALPHA 才启用逐像素混合（否则整窗按不透明拷贝，透明区变纯黑）
+    BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(g_hwnd, nullptr, &ptDst, &sz, mem, &ptSrc, 0, &bf, ULW_ALPHA);
 
     SelectObject(mem, old);
@@ -281,6 +279,17 @@ cfg:
 
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
+        case WM_NCHITTEST: {
+            POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&rc), 2);
+            if (PtInRect(&rc, pt) &&
+                pt.x - rc.left >= g_hitL && pt.x - rc.left < g_hitR &&
+                pt.y - rc.top >= g_hitT && pt.y - rc.top < g_hitB)
+                return HTCLIENT;        // 文字/进度条区域：胶囊交互（左键切换、右键菜单）
+            return HTTRANSPARENT;       // 其余透明像素：点击落到下层任务栏图标
+        }
         case WM_LBUTTONDOWN:
             adapters::ToggleHostWindow(); // 单击 ≡ 宿主托盘左键
             return 0;
