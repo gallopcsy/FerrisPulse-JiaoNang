@@ -301,6 +301,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     anchor();
                     if (g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
                     applyVisibility();
+                    if (IsWindowVisible(g_hwnd)) {
+                        // 任务栏/托盘气泡等 topmost 窗口重排会把胶囊压回任务栏下方 → 每 2s 重申置顶
+                        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                    }
                 }
             }
             return 0;
