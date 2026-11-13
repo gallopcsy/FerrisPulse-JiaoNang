@@ -136,5 +136,6 @@ pwsh -File build.ps1
 
 ## 许可
 
-欢迎使用与改进。如仓库尚未附带 LICENSE 文件，默认保留所有权利；
-需要开源协议建议选用 MIT（一行即可添加）。
+本项目基于 **MIT License** 开源，详见 [LICENSE](LICENSE)。
+
+Copyright (c) 2026 gallopcsy
