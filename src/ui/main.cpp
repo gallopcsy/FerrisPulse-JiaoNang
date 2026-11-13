@@ -9,6 +9,7 @@
 #include <gdiplus.h>
 #include <string>
 #include <cstdio>
+#include <cmath>
 #include "core/CapsuleCore.h"
 #include "adapters/RegistryReader.h"
 #include "adapters/Environment.h"
@@ -25,9 +26,11 @@ static int g_x = -10000, g_y = -10000;
 static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
 // z序守护钩子（前台/窗口重排事件 → 即时重申置顶，见 ensureTopmost）
 static HWINEVENTHOOK g_hookFg = nullptr, g_hookRe = nullptr;
+// 充电呼吸动画开关（仅在「充电 + 可见」时挂 40ms 定时器，其余时刻零开销）
+static bool g_animOn = false;
 static ULONG_PTR g_gdiplusToken = 0;
 
-enum { IDT_POLL = 1, IDT_LIFE = 2 };
+enum { IDT_POLL = 1, IDT_LIFE = 2, IDT_ANIM = 3 };
 enum {
     ID_OPEN = 1001,
     ID_REFRESH = 1002,
@@ -57,7 +60,13 @@ static void roundRectPath(Gdiplus::GraphicsPath& p, float x, float y, float w, f
     p.CloseFigure();
 }
 
-// 测量：布局 = pad + 闪电 + 名字 + 10 + 进度条76 + 6 + 百分比 + pad
+// 亮度缩放（充电呼吸用）：保持 alpha，仅按比例压 RGB
+static Gdiplus::Color dim(Gdiplus::Color c, float k) {
+    return Gdiplus::Color(c.GetA(),
+                          (BYTE)(c.GetR() * k), (BYTE)(c.GetG() * k), (BYTE)(c.GetB() * k));
+}
+
+// 测量：布局 = pad + 名字 + 10 + 进度条76 + 6 + 百分比 + pad
 // 注意：Graphics 必须先于 DeleteDC 析构（内层作用域），否则析构触碰已释放 DC（UB）。
 static int measureWidth() {
     std::wstring name = utf8ToWide(g_vm.displayName);
@@ -152,11 +161,18 @@ static void render() {
     float fillW = barW * g_vm.percent / 100.0f;
     if (g_vm.percent > 0 && fillW < 4.0f) fillW = 4.0f;
     if (fillW > 1.0f) {
-        Gdiplus::LinearGradientBrush bar(
-            Gdiplus::RectF(x, barY, fillW, barH),
-            g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xFF, 0x45, 0x3A) : Gdiplus::Color(0xFF, 0x34, 0xC7, 0x59),
-            g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xFF, 0x69, 0x61) : Gdiplus::Color(0xFF, 0x2F, 0xB4, 0x5A),
-            0.0f);
+        // 充电呼吸：2s 一个周期，亮度 0.60 → 1.00（非充电恒为 1，视觉与旧版一致）
+        float breath = 1.0f;
+        if (g_vm.charging) {
+            const double t = (double)(GetTickCount64() % 2000ull) / 2000.0;
+            breath = 0.60f + 0.40f * (float)(0.5 * (1.0 - std::cos(t * 2.0 * 3.14159265358979323846)));
+        }
+        Gdiplus::Color c1 = g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xFF, 0x45, 0x3A)
+                                            : Gdiplus::Color(0xFF, 0x34, 0xC7, 0x59);
+        Gdiplus::Color c2 = g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xFF, 0x69, 0x61)
+                                            : Gdiplus::Color(0xFF, 0x2F, 0xB4, 0x5A);
+        if (breath < 0.999f) { c1 = dim(c1, breath); c2 = dim(c2, breath); }
+        Gdiplus::LinearGradientBrush bar(Gdiplus::RectF(x, barY, fillW, barH), c1, c2, 0.0f);
         Gdiplus::GraphicsPath fill;
         roundRectPath(fill, x, barY, fillW, barH, barH / 2.0f);
         gr.SetClip(&fill);
@@ -220,6 +236,17 @@ static void applyVisibility() {
     }
 }
 
+// 充电呼吸动画：40ms/帧（25fps），仅「充电 + 可见」时挂表；隐藏/离电立即摘表
+static void applyAnimTimer() {
+    bool want = g_vm.charging && g_vm.visible;
+    if (want && !g_animOn) {
+        g_animOn = SetTimer(g_hwnd, IDT_ANIM, 40, nullptr) != 0;
+    } else if (!want && g_animOn) {
+        KillTimer(g_hwnd, IDT_ANIM);
+        g_animOn = false;
+    }
+}
+
 static void present() {
     g_capsuleW = measureWidth();
     anchor();
@@ -234,6 +261,7 @@ static void sampleNow() {
     applyPollTimer();
     present();
     applyVisibility();
+    applyAnimTimer();
 }
 
 static void showMenu() {
@@ -331,6 +359,13 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_TIMER:
             if (wp == IDT_POLL) {
                 sampleNow();
+            } else if (wp == IDT_ANIM) {
+                if (!g_vm.charging || !g_vm.visible) {
+                    KillTimer(hwnd, IDT_ANIM);
+                    g_animOn = false;
+                } else {
+                    render(); // 仅重绘呼吸相位，不重锚定/不重读注册表
+                }
             } else if (wp == IDT_LIFE) {
                 bool host = adapters::IsHostRunning();
                 if (host != g_snap.hostPresent) {
@@ -341,6 +376,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     anchor();
                     if (g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
                     applyVisibility();
+                    applyAnimTimer();
                     if (IsWindowVisible(g_hwnd)) {
                         // 任务栏/托盘气泡等 topmost 窗口重排会把胶囊压回任务栏下方 → 每 2s 重申置顶
                         SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
@@ -360,6 +396,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             KillTimer(hwnd, IDT_POLL);
             KillTimer(hwnd, IDT_LIFE);
+            KillTimer(hwnd, IDT_ANIM);
+            g_animOn = false;
             if (g_hookFg) UnhookWinEvent(g_hookFg);
             if (g_hookRe) UnhookWinEvent(g_hookRe);
             PostQuitMessage(0);
