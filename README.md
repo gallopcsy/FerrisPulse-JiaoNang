@@ -6,6 +6,8 @@
 不改宿主一行代码、不碰 HID、零额外耗电——它只是把宿主已经写进注册表的电量缓存
 "搬到"任务栏上常驻显示。
 
+> **下载**：[Releases](https://github.com/gallopcsy/FerrisPulse-JiaoNang/releases/latest)　|　**协议**：[MIT](LICENSE)
+
 ---
 
 ## 为什么做这个
