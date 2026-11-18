@@ -1,9 +1,9 @@
-# build.ps1 — 构建测试 + 胶囊可执行文件
+# build.ps1 — 构建测试 + 胶囊可执行文件（MinGW-w64 g++ / PowerShell 7）
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 # 定位 g++（winget 用户级安装不会刷新已开 shell 的 PATH）
-$gxx = (Get-Command g++ -ErrorAction SilentlyContinue)
+$gxx = Get-Command g++ -ErrorAction SilentlyContinue
 if (-not $gxx) {
     $pkg = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages') -Directory -Filter 'BrechtSanders.WinLibs*' -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($pkg) {
@@ -12,13 +12,10 @@ if (-not $gxx) {
     }
 }
 if (-not $gxx) { Write-Error 'g++ not found. Install: winget install -e --id BrechtSanders.WinLibs.MCF.UCRT'; exit 1 }
-$gxx = "$gxx"
 
-# -ffunction-sections/-fdata-sections + --gc-sections：丢弃未引用的函数/数据（含 libstdc++ 模板实例）
-# -fno-exceptions/-fno-rtti：代码零异常、零 RTTI，去掉展开表与 typeinfo（进一步瘦身）
+# 裁剪：丢掉未引用的函数/数据；零异常、零 RTTI（-fno-* 去掉展开表与 typeinfo）
 $cxx = @('-std=c++17', '-Wall', '-Wextra', '-ffunction-sections', '-fdata-sections',
-         '-fno-exceptions', '-fno-rtti',
-         '-DUNICODE', '-D_UNICODE', '-D_WIN32_WINNT=0x0A00')
+         '-fno-exceptions', '-fno-rtti', '-DUNICODE', '-D_UNICODE', '-D_WIN32_WINNT=0x0A00')
 
 New-Item -ItemType Directory -Force -Path bin | Out-Null
 
@@ -29,10 +26,12 @@ if ($LASTEXITCODE -ne 0) { Write-Error 'test build failed'; exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { Write-Error "tests FAILED ($LASTEXITCODE)"; exit $LASTEXITCODE }
 
 # 2) 主程序（绿色单文件：静态链接、无控制台、裁剪符号）
+# 注意：g++ 走 ANSI 参数，直接输出中文文件名会乱码 → 先出 ASCII 名再改名。
 $srcs = @('src\ui\main.cpp', 'src\adapters\RegistryReader.cpp', 'src\adapters\Environment.cpp', 'src\core\CapsuleCore.cpp')
 $libs = @('-lgdiplus', '-lgdi32', '-lmsimg32', '-lshell32', '-ladvapi32', '-luser32', '-lole32')
-# 直接输出到最终文件名（不在脚本里删文件：删除保护会拒绝脚本内的删除命令）
+$tmpExe = 'bin\capsule.exe'
 $out = 'bin\设备任务栏胶囊.exe'
-& $gxx @cxx -Os -municode -mwindows -static -s -flto '-Wl,--gc-sections' -Isrc -o $out @srcs @libs
+& $gxx @cxx -Os -municode -mwindows -static -s -flto '-Wl,--gc-sections' -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-ident -Isrc -o $tmpExe @srcs @libs
 if ($LASTEXITCODE -ne 0) { Write-Error 'exe build failed'; exit $LASTEXITCODE }
+Move-Item -LiteralPath $tmpExe -Destination $out -Force
 Write-Host ("BUILD OK  ->  {0}  ({1:N0} bytes)" -f (Join-Path $PSScriptRoot $out), (Get-Item $out).Length)

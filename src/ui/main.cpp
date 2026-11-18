@@ -23,8 +23,8 @@ static int g_capsuleW = 240, g_capsuleH = 32;
 static int g_x = -10000, g_y = -10000;
 // 内容命中盒（屏幕坐标窗口内相对值）：盒外 WM_NCHITTEST 返回 HTTRANSPARENT，点击落到下层任务栏图标
 static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
-// z序守护钩子（前台/窗口重排事件 → 即时重申置顶，见 ensureTopmost）
-static HWINEVENTHOOK g_hookFg = nullptr, g_hookRe = nullptr, g_hookTray = nullptr;
+// WinEvent 钩子（0=前台切换 1=窗口重排 → 重申置顶；2=任务栏显隐/移动 → 跟随）
+static HWINEVENTHOOK g_hooks[3] = {nullptr, nullptr, nullptr};
 // 任务栏窗口缓存 + 朝向（垂直任务栏放不下胶囊，直接隐藏而不是错位）
 static HWND g_tray = nullptr;
 static bool g_trayVertical = false;
@@ -289,21 +289,18 @@ static void applyAnimTimer() {
     }
 }
 
-static void present() {
+// 布局一次到位：测宽 → 锚定 → （几何变了或 force 时）重绘 → 显隐 → 呼吸表。
+// force=true 用于数据变化（内容必须重画）；false 用于任务栏跟随（几何没变就不重画）。
+static void layout(bool force) {
+    const int ox = g_x, oy = g_y, ow = g_capsuleW, oh = g_capsuleH;
     g_capsuleW = measureWidth();
     anchor();
-    render();
-}
-
-// 跟随任务栏几何/显隐：位置变了才重绘，任务栏滑走时由 applyVisibility 收起
-static void followTray() {
-    int ox = g_x, oy = g_y, ow = g_capsuleW, oh = g_capsuleH;
-    g_capsuleW = measureWidth();
-    anchor();
-    if (g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
+    if (force || g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
     applyVisibility();
     applyAnimTimer();
 }
+
+static void followTray() { layout(false); }
 
 static void sampleNow() {
     Snapshot s = adapters::ReadRegistrySnapshot();
@@ -311,9 +308,7 @@ static void sampleNow() {
     g_snap = std::move(s);
     g_vm = Reduce(g_snap, g_cfg);
     applyPollTimer();
-    present();
-    applyVisibility();
-    applyAnimTimer();
+    layout(true);
 }
 
 static void showMenu() {
@@ -322,17 +317,17 @@ static void showMenu() {
     AppendMenuW(m, MF_STRING, ID_REFRESH, L"立即刷新");
     HMENU sub = CreatePopupMenu();
     AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, L"自动同步频率");
-    AppendMenuW(sub, MF_STRING | (g_cfg.freqMode == FreqMode::FollowHost ? MF_CHECKED : 0),
-                ID_FREQ_FOLLOW, L"跟随宿主（默认）");
-    AppendMenuW(sub, MF_STRING | (g_cfg.freqMode == FreqMode::Sec30 ? MF_CHECKED : 0),
-                ID_FREQ_30S, L"30秒");
-    AppendMenuW(sub, MF_STRING | (g_cfg.freqMode == FreqMode::Min1 ? MF_CHECKED : 0),
-                ID_FREQ_1M, L"1分钟");
-    AppendMenuW(sub, MF_STRING | (g_cfg.freqMode == FreqMode::Min5 ? MF_CHECKED : 0),
-                ID_FREQ_5M, L"5分钟");
-    BOOL on = adapters::IsAutostartOn();
-    AppendMenuW(m, MF_STRING | (on ? MF_CHECKED : 0), ID_AUTOSTART,
-                L"开机自动启动");
+    // 频率档位表：{命令 ID, 档位, 文案}
+    static const struct { UINT id; FreqMode mode; const wchar_t* text; } kFreqs[] = {
+        {ID_FREQ_FOLLOW, FreqMode::FollowHost, L"跟随宿主（默认）"},
+        {ID_FREQ_30S,    FreqMode::Sec30,     L"30秒"},
+        {ID_FREQ_1M,     FreqMode::Min1,      L"1分钟"},
+        {ID_FREQ_5M,     FreqMode::Min5,      L"5分钟"},
+    };
+    for (const auto& fr : kFreqs)
+        AppendMenuW(sub, MF_STRING | (g_cfg.freqMode == fr.mode ? MF_CHECKED : 0), fr.id, fr.text);
+    AppendMenuW(m, MF_STRING | (adapters::IsAutostartOn() ? MF_CHECKED : 0),
+                ID_AUTOSTART, L"开机自动启动");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_EXIT, L"退出本程序");
 
@@ -342,21 +337,21 @@ static void showMenu() {
     UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
                                 pt.x, pt.y, g_hwnd, nullptr);
     DestroyMenu(m);
-    switch (cmd) {
-        case ID_OPEN: adapters::ShowHostWindow(); break;
-        case ID_REFRESH: sampleNow(); break; // 不打乱采样相位（仅即时重读）
-        case ID_FREQ_FOLLOW: g_cfg.freqMode = FreqMode::FollowHost; goto cfg;
-        case ID_FREQ_30S: g_cfg.freqMode = FreqMode::Sec30; goto cfg;
-        case ID_FREQ_1M: g_cfg.freqMode = FreqMode::Min1; goto cfg;
-        case ID_FREQ_5M: g_cfg.freqMode = FreqMode::Min5; goto cfg;
-        case ID_AUTOSTART: adapters::SetAutostart(!adapters::IsAutostartOn()); break;
-        case ID_EXIT: DestroyWindow(g_hwnd); break;
-        default: break;
+    bool freqChanged = false;
+    for (const auto& fr : kFreqs)
+        if (cmd == fr.id) { g_cfg.freqMode = fr.mode; freqChanged = true; }
+    if (freqChanged) {
+        adapters::SaveConfig(g_cfg);
+        sampleNow(); // applyPollTimer 生效新档位
+    } else if (cmd == ID_OPEN) {
+        adapters::ShowHostWindow();
+    } else if (cmd == ID_REFRESH) {
+        sampleNow(); // 不打乱采样相位（仅即时重读）
+    } else if (cmd == ID_AUTOSTART) {
+        adapters::SetAutostart(!adapters::IsAutostartOn());
+    } else if (cmd == ID_EXIT) {
+        DestroyWindow(g_hwnd);
     }
-    return;
-cfg:
-    adapters::SaveConfig(g_cfg);
-    sampleNow(); // applyPollTimer 生效新档位
 }
 
 // ── z序守护 ──────────────────────────────────────────────────────
@@ -365,18 +360,25 @@ cfg:
 // 订阅前台/窗口重排事件，在被压住的瞬间立即重申置顶；仅当 z 链上真的查到任务栏
 // 高于自己才 SetWindowPos，避免自身重排再触发回调造成循环。
 static bool capsuleBelowTray() {
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!tray) return false;
+    refreshTray();
+    if (!g_tray) return false;
     HWND h = g_hwnd;
     for (int i = 0; i < 64 && h; ++i) {
         h = GetWindow(h, GW_HWNDPREV); // prev = 在 Z 序中高于自己的窗口
-        if (h == tray) return true;
+        if (h == g_tray) return true;
     }
     return false;
 }
 
+// 被压住或被 explorer 降级出 topmost 层都要救回来；重入保护防止自身重排事件递归
 static void ensureTopmost() {
-    if (g_hwnd && IsWindowVisible(g_hwnd) && capsuleBelowTray()) raiseTopmost();
+    static bool inCall = false;
+    if (inCall || !g_hwnd || !IsWindowVisible(g_hwnd)) return;
+    const bool lostTopmost = (GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
+    if (!lostTopmost && !capsuleBelowTray()) return;
+    inCall = true;
+    raiseTopmost();
+    inCall = false;
 }
 
 static void CALLBACK onZEvent(HWINEVENTHOOK, DWORD, HWND, LONG idObject, LONG, DWORD, DWORD) {
@@ -449,9 +451,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, IDT_LIFE);
             KillTimer(hwnd, IDT_ANIM);
             g_animOn = false;
-            if (g_hookFg) UnhookWinEvent(g_hookFg);
-            if (g_hookRe) UnhookWinEvent(g_hookRe);
-            if (g_hookTray) UnhookWinEvent(g_hookTray);
+            for (HWINEVENTHOOK& h : g_hooks) if (h) { UnhookWinEvent(h); h = nullptr; }
             PostQuitMessage(0);
             return 0;
     }
@@ -491,15 +491,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     sampleNow(); // 首采：决定是否显示
     SetTimer(g_hwnd, IDT_LIFE, 2000, nullptr);
 
-    // z序守护：被任务栏重排压下时立即（毫秒级）拉回，2s LIFE 仅作兜底
-    g_hookFg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
-                               nullptr, onZEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
-    g_hookRe = SetWinEventHook(EVENT_OBJECT_REORDER, EVENT_OBJECT_REORDER,
-                               nullptr, onZEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
-    // 任务栏显隐/移动（含自动隐藏滑入滑出）：立即同步胶囊显隐与位置
-    g_tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    g_hookTray = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE,
-                                 nullptr, onTrayEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+    // 事件驱动：z 序被压 → 毫秒级拉回；任务栏滑入滑出/重建 → 立即跟随（2s LIFE 仅兜底）
+    struct { UINT lo, hi; WINEVENTPROC proc; } const watchers[] = {
+        {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, onZEvent},
+        {EVENT_OBJECT_REORDER,    EVENT_OBJECT_REORDER,    onZEvent},
+        {EVENT_OBJECT_SHOW,       EVENT_OBJECT_LOCATIONCHANGE, onTrayEvent},
+    };
+    refreshTray();
+    for (int i = 0; i < 3; ++i)
+        g_hooks[i] = SetWinEventHook(watchers[i].lo, watchers[i].hi, nullptr,
+                                     watchers[i].proc, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
