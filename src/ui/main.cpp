@@ -23,11 +23,16 @@ static int g_capsuleW = 240, g_capsuleH = 32;
 static int g_x = -10000, g_y = -10000;
 // 内容命中盒（屏幕坐标窗口内相对值）：盒外 WM_NCHITTEST 返回 HTTRANSPARENT，点击落到下层任务栏图标
 static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
-// WinEvent 钩子（0=前台切换 1=窗口重排 → 重申置顶；2=任务栏显隐/移动 → 跟随）
-static HWINEVENTHOOK g_hooks[3] = {nullptr, nullptr, nullptr};
+// 任务栏显隐/移动的 WinEvent 钩子
+static HWINEVENTHOOK g_hookTray = nullptr;
 // 任务栏窗口缓存 + 朝向（垂直任务栏放不下胶囊，直接隐藏而不是错位）
 static HWND g_tray = nullptr;
 static bool g_trayVertical = false;
+// SetParent 方案：渲染窗口挂成任务栏子窗口（排在 XAML 合成层之上，不被面板遮挡）；
+// 交互窗口是独立顶层分层窗（子窗口收不到鼠标消息，必须分离）。
+static bool g_child = false;
+static POINT g_clientPos{0, 0};
+static HWND g_hitHwnd = nullptr;
 
 // explorer 重启会重建任务栏窗口：句柄失效（或被新句柄替换）时必须重新解析
 static void refreshTray() {
@@ -40,18 +45,41 @@ static bool isTrayClass(HWND hwnd) {
     GetClassNameW(hwnd, cls, 32);
     return wcscmp(cls, L"Shell_TrayWnd") == 0;
 }
+// 挂成任务栏子窗口。实证可行的确切顺序（探针程序 combo.exe 验证）：
+//   1) 窗口以 popup 创建（WS_EX_LAYERED 保留）
+//   2) SetWindowLongPtrW(GWL_EXSTYLE, ex & ~WS_EX_TOPMOST)
+//   3) SetWindowLongPtrW(GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)   ← 必须先切 CHILD
+//   4) SetParent(hwnd, tray)                                          ← 再 SetParent
+// 顺序反了（先 SetParent 再切样式）只会得到 owner 关系，胶囊仍被面板遮挡。
+static bool attachToTray() {
+    refreshTray();
+    if (!g_tray || !g_hwnd) return false;
+    if (g_child && GetParent(g_hwnd) == g_tray) return true;
+
+    LONG_PTR style = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
+    LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);
+    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TOPMOST);
+    SetWindowLongPtrW(g_hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD);
+    SetParent(g_hwnd, g_tray);
+
+    if (GetParent(g_hwnd) != g_tray) {   // 未挂上 → 还原，稍后重试
+        SetWindowLongPtrW(g_hwnd, GWL_STYLE, (style & ~WS_CHILD) | WS_POPUP);
+        SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex | WS_EX_TOPMOST);
+        return false;
+    }
+    g_child = true;   // 子窗口 z 序由父窗口决定，无需再置顶
+    return true;
+}
+
+// explorer 重启：任务栏子窗口随旧任务栏销毁 → 用新句柄重建并重挂
+static void rebindTray() {
+    if (!g_tray) return;
+    if (g_child && g_hwnd && IsWindow(g_hwnd) && GetParent(g_hwnd) == g_tray) return;
+    attachToTray();
+}
+
 // 充电呼吸动画开关（仅在「充电 + 可见」时挂 40ms 定时器，其余时刻零开销）
 static bool g_animOn = false;
-// 覆盖自检：Win11「快速设置 / 通知中心」由 DWM 合成层直接叠加，任何 TOPMOST 窗口都压不过它
-// （实测：强制 SetWindowPos(HWND_TOPMOST) 后像素仍被面板覆盖）。唯一可行策略是让位：
-// 用像素回采发现胶囊被盖住 → 收起；面板关闭（像素恢复）后再出现。
-static int g_probeX = 0, g_probeY = 0;
-static bool g_probeValid = false;
-static unsigned g_probeRgb = 0;      // 满亮度时的期望色
-static bool g_probeAnimated = false; // 呼吸动画中：亮度在 0.60–1.00 之间浮动
-static bool g_yielded = false;      // 已因被覆盖而让位
-static ULONGLONG g_yieldAt = 0;
-static ULONGLONG g_shownAt = 0;     // 刚显示的宽限期（DWM 合成一帧需要时间）
 static ULONG_PTR g_gdiplusToken = 0;
 
 enum { IDT_POLL = 1, IDT_LIFE = 2, IDT_ANIM = 3 };
@@ -141,7 +169,47 @@ static void anchor() {
     if (g_capsuleH > 40) g_capsuleH = 40;
     g_y = tr.top + (taskH - g_capsuleH) / 2;
     g_x = right - 8 - g_capsuleW;
+    POINT p{g_x, g_y};
+    if (ScreenToClient(g_tray, &p)) g_clientPos = p; // 子窗口用客户区坐标
 }
+
+// 交互窗口：与胶囊同位置同尺寸；内容盒 alpha=1（1/255，肉眼不可见但可命中），
+// 盒外 alpha=0 → 点击穿透到任务栏图标。渲染窗是子窗口、收不到鼠标，点击全靠它。
+static void syncHitWindow(int W, int H) {
+    if (!g_hitHwnd) return;
+    const bool vis = IsWindowVisible(g_hwnd) != 0;
+    if (!vis) {
+        if (IsWindowVisible(g_hitHwnd)) ShowWindow(g_hitHwnd, SW_HIDE);
+        return;
+    }
+    Gdiplus::Bitmap hit(W, H, PixelFormat32bppPARGB);
+    if (hit.GetLastStatus() == Gdiplus::Ok) {
+        Gdiplus::Graphics g(&hit);
+        g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+        g.Clear(Gdiplus::Color(0, 0, 0, 0));
+        Gdiplus::SolidBrush box(Gdiplus::Color(1, 0, 0, 0));
+        if (g_hitR > g_hitL && g_hitB > g_hitT)
+            g.FillRectangle(&box, g_hitL, g_hitT, g_hitR - g_hitL, g_hitB - g_hitT);
+        g.Flush();
+        HBITMAP hb = nullptr;
+        if (hit.GetHBITMAP(Gdiplus::Color(0, 0, 0, 0), &hb) == Gdiplus::Ok && hb) {
+            HDC mdc = CreateCompatibleDC(nullptr);
+            HGDIOBJ old = SelectObject(mdc, hb);
+            POINT src{0, 0}, dst{g_x, g_y};
+            SIZE sz{W, H};
+            BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            UpdateLayeredWindow(g_hitHwnd, nullptr, &dst, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+            SelectObject(mdc, old);
+            DeleteDC(mdc);
+            DeleteObject(hb);
+        }
+    }
+    if (!IsWindowVisible(g_hitHwnd)) ShowWindow(g_hitHwnd, SW_SHOWNOACTIVATE);
+    SetWindowPos(g_hitHwnd, HWND_TOPMOST, g_x, g_y, W, H,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+}
+
+static void syncHitWindow(int W, int H);
 
 // GDI+ 渲染 → 分层窗口呈现
 static void render() {
@@ -199,12 +267,6 @@ static void render() {
         Gdiplus::Color c2 = g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xFF, 0x69, 0x61)
                                             : Gdiplus::Color(0xFF, 0x2F, 0xB4, 0x5A);
         if (breath < 0.999f) { c1 = dim(c1, breath); c2 = dim(c2, breath); }
-        // 探针：进度条左端内侧一点（避开圆角/抗锯齿），用渐变起色作期望值
-        g_probeX = g_x + (int)(x + 3.0f);
-        g_probeY = g_y + (int)(barY + barH / 2.0f);
-        g_probeRgb = ((unsigned)c1.GetR() << 16) | ((unsigned)c1.GetG() << 8) | (unsigned)c1.GetB();
-        g_probeAnimated = g_vm.charging;
-        g_probeValid = true;
         Gdiplus::LinearGradientBrush bar(Gdiplus::RectF(x, barY, fillW, barH), c1, c2, 0.0f);
         Gdiplus::GraphicsPath fill;
         roundRectPath(fill, x, barY, fillW, barH, barH / 2.0f);
@@ -237,7 +299,9 @@ static void render() {
 
     POINT ptSrc{0, 0};
     POINT ptDst{g_x, g_y};
+    if (g_child) ptDst = g_clientPos;
     SIZE sz{W, H};
+    syncHitWindow(W, H);
     // 字段序：{BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat}
     // AlphaFormat 必须 = AC_SRC_ALPHA 才启用逐像素混合（否则整窗按不透明拷贝，透明区变纯黑）
     BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
@@ -259,6 +323,7 @@ static void applyPollTimer() {
 
 // 重申置顶：不移动、不激活、不参与 z 序链重排（显示/兜底/事件守护三处复用）
 static void raiseTopmost() {
+    if (g_child) return; // 子窗口 z 序由父窗口决定
     SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }
@@ -284,59 +349,18 @@ static bool trayOnScreen() {
 }
 
 // 像素回采：内部画的期望色与屏幕实际像素差太多 ⇒ 被合成层挡住
-static bool coveredDown() {
-    if (!g_probeValid || !IsWindowVisible(g_hwnd)) return false;
-    HDC dc = GetDC(nullptr);
-    if (!dc) return false;
-    const COLORREF px = GetPixel(dc, g_probeX, g_probeY);
-    ReleaseDC(nullptr, dc);
-    if (px == CLR_INVALID) return false;
-    const int pr = (int)GetRValue(px), pg = (int)GetGValue(px), pb = (int)GetBValue(px);
-    if (g_probeAnimated) {
-        // 呼吸相位未知：只要求落在「同一色相 × 0.55–1.05 亮度」区间内
-        auto inRange = [](int v, int base) {
-            return v >= (int)(base * 0.55f) - 6 && v <= (int)(base * 1.05f) + 6;
-        };
-        return !(inRange(pr, (int)((g_probeRgb >> 16) & 0xFF)) &&
-                 inRange(pg, (int)((g_probeRgb >> 8) & 0xFF)) &&
-                 inRange(pb, (int)(g_probeRgb & 0xFF)));
-    }
-    const int dr = pr - (int)((g_probeRgb >> 16) & 0xFF);
-    const int dg = pg - (int)((g_probeRgb >> 8) & 0xFF);
-    const int db = pb - (int)(g_probeRgb & 0xFF);
-    return dr * dr + dg * dg + db * db > 60 * 60;
-}
-
 static void applyVisibility() {
     const bool want = g_vm.visible && !g_trayVertical && trayOnScreen();
     const bool is = IsWindowVisible(g_hwnd) != 0;
-    if (!want) {
-        if (is) ShowWindow(g_hwnd, SW_HIDE);
-        g_yielded = false;
-        return;
-    }
-    const ULONGLONG now = GetTickCount64();
-    if (!is) {
-        // 被合成层盖住时已让位：低频重试（此时胶囊区域正被面板覆盖，用户看不到任何闪动）
-        if (g_yielded && now - g_yieldAt < 900) return;
+    if (want && !is) {
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
         raiseTopmost();
-        render(); // 先画，再回采
-        g_shownAt = now;
-        if (coveredDown()) {
-            ShowWindow(g_hwnd, SW_HIDE);
-            g_yielded = true;
-            g_yieldAt = now;
-        } else {
-            g_yielded = false;
-        }
-        return;
-    }
-    if (now - g_shownAt < 400) return; // 刚显示：等 DWM 合成完成再判定，避免自激抖动
-    if (coveredDown()) { // 显示中却被盖住 → 让位
+        syncHitWindow(g_capsuleW, g_capsuleH);
+    } else if (!want && is) {
         ShowWindow(g_hwnd, SW_HIDE);
-        g_yielded = true;
-        g_yieldAt = now;
+        if (g_hitHwnd && IsWindowVisible(g_hitHwnd)) ShowWindow(g_hitHwnd, SW_HIDE);
+    } else if (want && is && g_hitHwnd && !IsWindowVisible(g_hitHwnd)) {
+        syncHitWindow(g_capsuleW, g_capsuleH);
     }
 }
 
@@ -416,87 +440,49 @@ static void showMenu() {
     }
 }
 
-// ── z序守护 ──────────────────────────────────────────────────────
-// explorer 在任务栏交互（点图标、开快速设置、托盘气泡、开始菜单）时会重排 topmost 层，
-// 把胶囊压到下面 → 表现为「胶囊被盖住 / 突然消失」。这里沿 z 序向上找第一个压住
-// 胶囊且与之相交的可见窗口，用几何相交判定而不只认任务栏句柄。
-
-// 是否有【任何可见窗口】压在自己上面并与胶囊矩形相交。
-// Win11 点击 WLAN/声音/电池 弹出的「快速设置」是 explorer 临时顶起来的顶层窗口，
-// 出现瞬间会排到胶囊之上；旧逻辑只比对 Shell_TrayWnd，对这种"别的窗口盖过来"完全无感，
-// 表现为胶囊被面板盖住 → 这里按几何相交判定，不区分窗口来源。
-static bool coveredFromAbove() {
-    RECT me{};
-    if (!GetWindowRect(g_hwnd, &me)) return false;
-    HWND h = g_hwnd;
-    for (int i = 0; i < 96; ++i) {
-        h = GetWindow(h, GW_HWNDPREV); // 沿 z 序逐级向上
-        if (!h) return false;
-        if (h == g_tray) return true;                 // 任务栏压上来（含托盘空白区）
-        if (!IsWindowVisible(h)) continue;
-        RECT r{};
-        if (!GetWindowRect(h, &r)) continue;
-        if (r.right - r.left <= 0 || r.bottom - r.top <= 0) continue;
-        if (r.right <= me.left || r.left >= me.right || r.bottom <= me.top || r.top >= me.bottom) continue;
-        // 排除自己进程内的窗口（如 GDI+ 钩子窗），其余一律视为遮挡
-        DWORD pid = 0;
-        GetWindowThreadProcessId(h, &pid);
-        if (pid == GetCurrentProcessId()) continue;
-        return true;                                   // 相交的可见窗口盖在上面
-    }
-    return false;
-}
-
-// 被压住 / 被降级出 topmost / 被别的 topmost 窗口盖住 —— 三种都要救回来；重入保护防递归
-static void ensureTopmost() {
-    static bool inCall = false;
-    if (inCall || !g_hwnd || !IsWindowVisible(g_hwnd)) return;
-    const bool lostTopmost = (GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
-    if (!lostTopmost && !coveredFromAbove()) return;
-    // 限流：explorer 弹面板时会连发重排事件，最多 120ms 抢一次，避免与宿主反复争抢
-    static ULONGLONG lastRaise = 0;
-    const ULONGLONG now = GetTickCount64();
-    if (!lostTopmost && now - lastRaise < 120) return;
-    lastRaise = now;
-    inCall = true;
-    raiseTopmost();
-    inCall = false;
-}
-
-static void CALLBACK onZEvent(HWINEVENTHOOK, DWORD, HWND, LONG idObject, LONG, DWORD, DWORD) {
-    // 实测 explorer 重排事件 idObject 可能是 OBJID_CLIENT(-4) 等，不按对象过滤；
-    // ensureTopmost 内部自带“真的被压住才动手”的判定，回调本身零开销。
-    (void)idObject;
-    ensureTopmost();
-    // 面板/合成层出现或消失时也立刻复核一次可见性（不必等 2s LIFE 兜底）
-    applyVisibility();
-}
-
 // 任务栏显隐/滑入滑出（自动隐藏）→ 立即跟随，不等 2s 轮询
 static void CALLBACK onTrayEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD) {
     // 任务栏（含自动隐藏滑入滑出、explorer 重启换句柄）→ 立即跟随
     if (isTrayClass(hwnd)) {
+        const bool newTray = (g_tray != nullptr && hwnd != g_tray);
         g_tray = hwnd;
+        if (newTray) rebindTray(); // explorer 重启 → 改挂到新任务栏
         followTray();
-        if (IsWindowVisible(g_hwnd)) raiseTopmost();
         return;
     }
-    // 其它顶层窗口出现/移动（快速设置、通知中心、托盘气泡……）→ 被盖住就立刻拉回
-    ensureTopmost();
+}
+
+// 交互窗口过程：只处理鼠标（渲染窗是子窗口，收不到鼠标消息）
+static LRESULT CALLBACK hitProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_NCHITTEST:
+            return HTCLIENT;
+        case WM_LBUTTONDOWN:
+            adapters::ToggleHostWindow();
+            return 0;
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+            showMenu();
+            return 0;
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_DESTROY:
+            g_hitHwnd = nullptr;
+            return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_NCHITTEST: {
+            // 渲染窗是任务栏子窗口，收不到系统点击派发；这里按内容盒返回 CLIENT，
+            // 命中后由下面的 WM_*BUTTON 分支直接转发给交互逻辑（同进程调用，最可靠）。
             POINT pt{ (short)LOWORD(lp), (short)HIWORD(lp) };
-            RECT rc;
-            GetClientRect(hwnd, &rc);
-            MapWindowPoints(hwnd, nullptr, reinterpret_cast<POINT*>(&rc), 2);
-            if (PtInRect(&rc, pt) &&
-                pt.x - rc.left >= g_hitL && pt.x - rc.left < g_hitR &&
-                pt.y - rc.top >= g_hitT && pt.y - rc.top < g_hitB)
-                return HTCLIENT;        // 文字/进度条区域：胶囊交互（左键切换、右键菜单）
-            return HTTRANSPARENT;       // 其余透明像素：点击落到下层任务栏图标
+            ScreenToClient(hwnd, &pt);
+            if (pt.x >= g_hitL && pt.x < g_hitR && pt.y >= g_hitT && pt.y < g_hitB)
+                return HTCLIENT;
+            return HTTRANSPARENT;
         }
         case WM_LBUTTONDOWN:
             adapters::ToggleHostWindow(); // 单击 ≡ 宿主托盘左键
@@ -520,6 +506,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (host != g_snap.hostPresent) {
                     sampleNow(); // 宿主出现/退出 → 立即重采
                 } else {
+                    // 尚未挂成子窗口时重试（任务栏可能刚就绪）
                     followTray();
                     // 任务栏/托盘气泡等 topmost 窗口重排会把胶囊压回任务栏下方 → 每 2s 重申置顶
                     if (IsWindowVisible(g_hwnd)) raiseTopmost();
@@ -535,11 +522,12 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0; // 分层窗口由 UpdateLayeredWindow 呈现，无传统绘制
         }
         case WM_DESTROY:
+            if (g_hitHwnd) { DestroyWindow(g_hitHwnd); g_hitHwnd = nullptr; }
             KillTimer(hwnd, IDT_POLL);
             KillTimer(hwnd, IDT_LIFE);
             KillTimer(hwnd, IDT_ANIM);
             g_animOn = false;
-            for (HWINEVENTHOOK& h : g_hooks) if (h) { UnhookWinEvent(h); h = nullptr; }
+            if (g_hookTray) { UnhookWinEvent(g_hookTray); g_hookTray = nullptr; }
             PostQuitMessage(0);
             return 0;
     }
@@ -569,6 +557,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wc.lpszClassName = L"DeviceTaskbarCapsuleWnd";
     RegisterClassExW(&wc);
 
+    WNDCLASSEXW hc = wc;
+    hc.lpfnWndProc = hitProc;
+    hc.lpszClassName = L"DeviceTaskbarCapsuleHitWnd";
+    RegisterClassExW(&hc);
+
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
                              wc.lpszClassName, L"",
                              WS_POPUP,
@@ -576,19 +569,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                              nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;
 
+    // 交互窗口：独立顶层分层窗（子窗口收不到鼠标消息）
+    g_hitHwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
+                                hc.lpszClassName, L"",
+                                WS_POPUP,
+                                0, 0, 10, 10,
+                                nullptr, nullptr, inst, nullptr);
+
+    attachToTray(); // 挂成任务栏子窗口（失败时 LIFE 定时器持续重试）
     sampleNow(); // 首采：决定是否显示
     SetTimer(g_hwnd, IDT_LIFE, 2000, nullptr);
 
-    // 事件驱动：z 序被压 → 毫秒级拉回；任务栏滑入滑出/重建 → 立即跟随（2s LIFE 仅兜底）
-    struct { UINT lo, hi; WINEVENTPROC proc; } const watchers[] = {
-        {EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, onZEvent},
-        {EVENT_OBJECT_REORDER,    EVENT_OBJECT_REORDER,    onZEvent},
-        {EVENT_OBJECT_SHOW,       EVENT_OBJECT_LOCATIONCHANGE, onTrayEvent},
-    };
+    // 任务栏显隐/滑入滑出/explorer 重启 → 立即跟随（2s LIFE 仅兜底）
     refreshTray();
-    for (int i = 0; i < 3; ++i)
-        g_hooks[i] = SetWinEventHook(watchers[i].lo, watchers[i].hi, nullptr,
-                                     watchers[i].proc, 0, 0, WINEVENT_OUTOFCONTEXT);
+    g_hookTray = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE,
+                                 nullptr, onTrayEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
