@@ -42,6 +42,16 @@ static bool isTrayClass(HWND hwnd) {
 }
 // 充电呼吸动画开关（仅在「充电 + 可见」时挂 40ms 定时器，其余时刻零开销）
 static bool g_animOn = false;
+// 覆盖自检：Win11「快速设置 / 通知中心」由 DWM 合成层直接叠加，任何 TOPMOST 窗口都压不过它
+// （实测：强制 SetWindowPos(HWND_TOPMOST) 后像素仍被面板覆盖）。唯一可行策略是让位：
+// 用像素回采发现胶囊被盖住 → 收起；面板关闭（像素恢复）后再出现。
+static int g_probeX = 0, g_probeY = 0;
+static bool g_probeValid = false;
+static unsigned g_probeRgb = 0;      // 满亮度时的期望色
+static bool g_probeAnimated = false; // 呼吸动画中：亮度在 0.60–1.00 之间浮动
+static bool g_yielded = false;      // 已因被覆盖而让位
+static ULONGLONG g_yieldAt = 0;
+static ULONGLONG g_shownAt = 0;     // 刚显示的宽限期（DWM 合成一帧需要时间）
 static ULONG_PTR g_gdiplusToken = 0;
 
 enum { IDT_POLL = 1, IDT_LIFE = 2, IDT_ANIM = 3 };
@@ -189,6 +199,12 @@ static void render() {
         Gdiplus::Color c2 = g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xFF, 0x69, 0x61)
                                             : Gdiplus::Color(0xFF, 0x2F, 0xB4, 0x5A);
         if (breath < 0.999f) { c1 = dim(c1, breath); c2 = dim(c2, breath); }
+        // 探针：进度条左端内侧一点（避开圆角/抗锯齿），用渐变起色作期望值
+        g_probeX = g_x + (int)(x + 3.0f);
+        g_probeY = g_y + (int)(barY + barH / 2.0f);
+        g_probeRgb = ((unsigned)c1.GetR() << 16) | ((unsigned)c1.GetG() << 8) | (unsigned)c1.GetB();
+        g_probeAnimated = g_vm.charging;
+        g_probeValid = true;
         Gdiplus::LinearGradientBrush bar(Gdiplus::RectF(x, barY, fillW, barH), c1, c2, 0.0f);
         Gdiplus::GraphicsPath fill;
         roundRectPath(fill, x, barY, fillW, barH, barH / 2.0f);
@@ -267,14 +283,60 @@ static bool trayOnScreen() {
                       : (vw >= 8 && vw * 3 >= tw);  // 垂直任务栏
 }
 
+// 像素回采：内部画的期望色与屏幕实际像素差太多 ⇒ 被合成层挡住
+static bool coveredDown() {
+    if (!g_probeValid || !IsWindowVisible(g_hwnd)) return false;
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    const COLORREF px = GetPixel(dc, g_probeX, g_probeY);
+    ReleaseDC(nullptr, dc);
+    if (px == CLR_INVALID) return false;
+    const int pr = (int)GetRValue(px), pg = (int)GetGValue(px), pb = (int)GetBValue(px);
+    if (g_probeAnimated) {
+        // 呼吸相位未知：只要求落在「同一色相 × 0.55–1.05 亮度」区间内
+        auto inRange = [](int v, int base) {
+            return v >= (int)(base * 0.55f) - 6 && v <= (int)(base * 1.05f) + 6;
+        };
+        return !(inRange(pr, (int)((g_probeRgb >> 16) & 0xFF)) &&
+                 inRange(pg, (int)((g_probeRgb >> 8) & 0xFF)) &&
+                 inRange(pb, (int)(g_probeRgb & 0xFF)));
+    }
+    const int dr = pr - (int)((g_probeRgb >> 16) & 0xFF);
+    const int dg = pg - (int)((g_probeRgb >> 8) & 0xFF);
+    const int db = pb - (int)(g_probeRgb & 0xFF);
+    return dr * dr + dg * dg + db * db > 60 * 60;
+}
+
 static void applyVisibility() {
-    bool want = g_vm.visible && !g_trayVertical && trayOnScreen();
-    bool is = IsWindowVisible(g_hwnd) != 0;
-    if (want && !is) {
+    const bool want = g_vm.visible && !g_trayVertical && trayOnScreen();
+    const bool is = IsWindowVisible(g_hwnd) != 0;
+    if (!want) {
+        if (is) ShowWindow(g_hwnd, SW_HIDE);
+        g_yielded = false;
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!is) {
+        // 被合成层盖住时已让位：低频重试（此时胶囊区域正被面板覆盖，用户看不到任何闪动）
+        if (g_yielded && now - g_yieldAt < 900) return;
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
         raiseTopmost();
-    } else if (!want && is) {
+        render(); // 先画，再回采
+        g_shownAt = now;
+        if (coveredDown()) {
+            ShowWindow(g_hwnd, SW_HIDE);
+            g_yielded = true;
+            g_yieldAt = now;
+        } else {
+            g_yielded = false;
+        }
+        return;
+    }
+    if (now - g_shownAt < 400) return; // 刚显示：等 DWM 合成完成再判定，避免自激抖动
+    if (coveredDown()) { // 显示中却被盖住 → 让位
         ShowWindow(g_hwnd, SW_HIDE);
+        g_yielded = true;
+        g_yieldAt = now;
     }
 }
 
@@ -355,27 +417,47 @@ static void showMenu() {
 }
 
 // ── z序守护 ──────────────────────────────────────────────────────
-// explorer 在任务栏交互（点击图标/托盘气泡/开始菜单）时会重排 topmost 层，把胶囊
-// 压回任务栏下方 → 表现为“点任务栏胶囊突然消失，2s 后又出现”。
-// 订阅前台/窗口重排事件，在被压住的瞬间立即重申置顶；仅当 z 链上真的查到任务栏
-// 高于自己才 SetWindowPos，避免自身重排再触发回调造成循环。
-static bool capsuleBelowTray() {
-    refreshTray();
-    if (!g_tray) return false;
+// explorer 在任务栏交互（点图标、开快速设置、托盘气泡、开始菜单）时会重排 topmost 层，
+// 把胶囊压到下面 → 表现为「胶囊被盖住 / 突然消失」。这里沿 z 序向上找第一个压住
+// 胶囊且与之相交的可见窗口，用几何相交判定而不只认任务栏句柄。
+
+// 是否有【任何可见窗口】压在自己上面并与胶囊矩形相交。
+// Win11 点击 WLAN/声音/电池 弹出的「快速设置」是 explorer 临时顶起来的顶层窗口，
+// 出现瞬间会排到胶囊之上；旧逻辑只比对 Shell_TrayWnd，对这种"别的窗口盖过来"完全无感，
+// 表现为胶囊被面板盖住 → 这里按几何相交判定，不区分窗口来源。
+static bool coveredFromAbove() {
+    RECT me{};
+    if (!GetWindowRect(g_hwnd, &me)) return false;
     HWND h = g_hwnd;
-    for (int i = 0; i < 64 && h; ++i) {
-        h = GetWindow(h, GW_HWNDPREV); // prev = 在 Z 序中高于自己的窗口
-        if (h == g_tray) return true;
+    for (int i = 0; i < 96; ++i) {
+        h = GetWindow(h, GW_HWNDPREV); // 沿 z 序逐级向上
+        if (!h) return false;
+        if (h == g_tray) return true;                 // 任务栏压上来（含托盘空白区）
+        if (!IsWindowVisible(h)) continue;
+        RECT r{};
+        if (!GetWindowRect(h, &r)) continue;
+        if (r.right - r.left <= 0 || r.bottom - r.top <= 0) continue;
+        if (r.right <= me.left || r.left >= me.right || r.bottom <= me.top || r.top >= me.bottom) continue;
+        // 排除自己进程内的窗口（如 GDI+ 钩子窗），其余一律视为遮挡
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == GetCurrentProcessId()) continue;
+        return true;                                   // 相交的可见窗口盖在上面
     }
     return false;
 }
 
-// 被压住或被 explorer 降级出 topmost 层都要救回来；重入保护防止自身重排事件递归
+// 被压住 / 被降级出 topmost / 被别的 topmost 窗口盖住 —— 三种都要救回来；重入保护防递归
 static void ensureTopmost() {
     static bool inCall = false;
     if (inCall || !g_hwnd || !IsWindowVisible(g_hwnd)) return;
     const bool lostTopmost = (GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
-    if (!lostTopmost && !capsuleBelowTray()) return;
+    if (!lostTopmost && !coveredFromAbove()) return;
+    // 限流：explorer 弹面板时会连发重排事件，最多 120ms 抢一次，避免与宿主反复争抢
+    static ULONGLONG lastRaise = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (!lostTopmost && now - lastRaise < 120) return;
+    lastRaise = now;
     inCall = true;
     raiseTopmost();
     inCall = false;
@@ -386,15 +468,21 @@ static void CALLBACK onZEvent(HWINEVENTHOOK, DWORD, HWND, LONG idObject, LONG, D
     // ensureTopmost 内部自带“真的被压住才动手”的判定，回调本身零开销。
     (void)idObject;
     ensureTopmost();
+    // 面板/合成层出现或消失时也立刻复核一次可见性（不必等 2s LIFE 兜底）
+    applyVisibility();
 }
 
 // 任务栏显隐/滑入滑出（自动隐藏）→ 立即跟随，不等 2s 轮询
 static void CALLBACK onTrayEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD) {
-    // explorer 重启后任务栏句柄会变：按窗口类重新绑定，而不是只认缓存句柄
-    if (!isTrayClass(hwnd)) return;
-    g_tray = hwnd;
-    followTray();
-    if (IsWindowVisible(g_hwnd)) raiseTopmost();
+    // 任务栏（含自动隐藏滑入滑出、explorer 重启换句柄）→ 立即跟随
+    if (isTrayClass(hwnd)) {
+        g_tray = hwnd;
+        followTray();
+        if (IsWindowVisible(g_hwnd)) raiseTopmost();
+        return;
+    }
+    // 其它顶层窗口出现/移动（快速设置、通知中心、托盘气泡……）→ 被盖住就立刻拉回
+    ensureTopmost();
 }
 
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
