@@ -24,16 +24,27 @@ static int g_x = -10000, g_y = -10000;
 // 内容命中盒（屏幕坐标窗口内相对值）：盒外 WM_NCHITTEST 返回 HTTRANSPARENT，点击落到下层任务栏图标
 static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
 // z序守护钩子（前台/窗口重排事件 → 即时重申置顶，见 ensureTopmost）
-static HWINEVENTHOOK g_hookFg = nullptr, g_hookRe = nullptr;
-// 任务栏“当前是否真实显示”：自动隐藏收起时 Shell_TrayWnd 会变成 0×0（不可见）
-static bool g_trayShown = true;
-// 任务栏显隐钩子：自动隐藏滑出/滑入 → 胶囊同步显示/隐藏
-static HWINEVENTHOOK g_hookTrayShow = nullptr, g_hookTrayHide = nullptr;
+static HWINEVENTHOOK g_hookFg = nullptr, g_hookRe = nullptr, g_hookTray = nullptr;
+// 任务栏窗口缓存 + 朝向（垂直任务栏放不下胶囊，直接隐藏而不是错位）
+static HWND g_tray = nullptr;
+static bool g_trayVertical = false;
+
+// explorer 重启会重建任务栏窗口：句柄失效（或被新句柄替换）时必须重新解析
+static void refreshTray() {
+    if (!g_tray || !IsWindow(g_tray)) g_tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+}
+
+static bool isTrayClass(HWND hwnd) {
+    if (!hwnd) return false;
+    wchar_t cls[32]{};
+    GetClassNameW(hwnd, cls, 32);
+    return wcscmp(cls, L"Shell_TrayWnd") == 0;
+}
 // 充电呼吸动画开关（仅在「充电 + 可见」时挂 40ms 定时器，其余时刻零开销）
 static bool g_animOn = false;
 static ULONG_PTR g_gdiplusToken = 0;
 
-enum { IDT_POLL = 1, IDT_LIFE = 2, IDT_ANIM = 3, IDT_TRAY = 4 };
+enum { IDT_POLL = 1, IDT_LIFE = 2, IDT_ANIM = 3 };
 enum {
     ID_OPEN = 1001,
     ID_REFRESH = 1002,
@@ -99,35 +110,17 @@ static int measureWidth() {
     return w;
 }
 
-// 任务栏当前是否真实显示：
-// 自动隐藏收起时 Shell_TrayWnd 会变成 0×0（部分版本是滑出屏幕外），两者都判为隐藏。
-static bool trayShown() {
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!tray || !IsWindowVisible(tray)) return false;
-    RECT tr{};
-    if (!GetWindowRect(tray, &tr)) return false;
-    if (tr.right <= tr.left || tr.bottom <= tr.top) return false; // 0×0：自动隐藏收起
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    HMONITOR mon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
-    if (mon && GetMonitorInfoW(mon, &mi)) {
-        const RECT& m = mi.rcMonitor;
-        if (tr.right <= m.left || tr.left >= m.right || tr.bottom <= m.top || tr.top >= m.bottom)
-            return false; // 已滑出屏幕（另一种隐藏实现）
-    }
-    return true;
-}
-
 // 锚定：Shell_TrayWnd → TrayNotifyWnd 左缘 -8 右对齐；垂直居中
+// 只支持水平任务栏（上/下）：垂直任务栏宽度不足以放下胶囊，由 applyVisibility 隐藏。
 static void anchor() {
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!tray) return;
+    refreshTray();
+    if (!g_tray) return;
     RECT tr{};
-    if (!GetWindowRect(tray, &tr)) return;
-    // 自动隐藏已收起：保持上一次坐标，避免把胶囊算到屏幕外
-    if (tr.right <= tr.left || tr.bottom <= tr.top) return;
+    if (!GetWindowRect(g_tray, &tr)) return;
+    g_trayVertical = (tr.bottom - tr.top) > (tr.right - tr.left);
+    if (g_trayVertical) return;
     LONG right = tr.right - 340; // 回退：任务栏右缘内收
-    HWND tn = FindWindowExW(tray, nullptr, L"TrayNotifyWnd", nullptr);
+    HWND tn = FindWindowExW(g_tray, nullptr, L"TrayNotifyWnd", nullptr);
     if (tn) {
         RECT r{};
         if (GetWindowRect(tn, &r)) right = r.left;
@@ -254,8 +247,28 @@ static void raiseTopmost() {
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
 }
 
+// 任务栏「实际露在屏幕上」判定：自动隐藏滑出屏幕后只剩 1–2px，视为隐藏。
+// 胶囊是独立窗口，任务栏滑走时它不会跟着走，必须靠这里同步隐藏/跟随。
+static bool trayOnScreen() {
+    refreshTray();
+    if (!g_tray || !IsWindowVisible(g_tray)) return false;
+    RECT t{};
+    if (!GetWindowRect(g_tray, &t)) return false;
+    const LONG tw = t.right - t.left, th = t.bottom - t.top;
+    if (tw <= 0 || th <= 0) return false;
+    HMONITOR mon = MonitorFromWindow(g_tray, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    RECT vis{};
+    if (!IntersectRect(&vis, &t, &mi.rcMonitor)) return false;
+    const LONG vw = vis.right - vis.left, vh = vis.bottom - vis.top;
+    return (tw >= th) ? (vh >= 8 && vh * 3 >= th)   // 水平任务栏：露出 >=8px 且 >=1/3
+                      : (vw >= 8 && vw * 3 >= tw);  // 垂直任务栏
+}
+
 static void applyVisibility() {
-    bool want = g_vm.visible && g_trayShown;
+    bool want = g_vm.visible && !g_trayVertical && trayOnScreen();
     bool is = IsWindowVisible(g_hwnd) != 0;
     if (want && !is) {
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
@@ -267,7 +280,7 @@ static void applyVisibility() {
 
 // 充电呼吸动画：40ms/帧（25fps），仅「充电 + 可见」时挂表；隐藏/离电立即摘表
 static void applyAnimTimer() {
-    bool want = g_vm.charging && g_vm.visible && g_trayShown;
+    bool want = g_vm.charging && g_vm.visible;
     if (want && !g_animOn) {
         g_animOn = SetTimer(g_hwnd, IDT_ANIM, 40, nullptr) != 0;
     } else if (!want && g_animOn) {
@@ -277,26 +290,19 @@ static void applyAnimTimer() {
 }
 
 static void present() {
-    if (!g_trayShown) return; // 任务栏收起时不重排位置（保持隐藏）
     g_capsuleW = measureWidth();
     anchor();
     render();
 }
 
-// 镜像任务栏显隐：自动隐藏收起 → 胶囊一起隐藏；任务栏滑出 → 重锚定并置顶
-static void applyTrayMirror() {
-    bool shown = trayShown();
-    if (shown == g_trayShown) return;
-    g_trayShown = shown;
-    if (!shown) {
-        ShowWindow(g_hwnd, SW_HIDE);
-        applyAnimTimer();
-        return;
-    }
-    present();
+// 跟随任务栏几何/显隐：位置变了才重绘，任务栏滑走时由 applyVisibility 收起
+static void followTray() {
+    int ox = g_x, oy = g_y, ow = g_capsuleW, oh = g_capsuleH;
+    g_capsuleW = measureWidth();
+    anchor();
+    if (g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
     applyVisibility();
     applyAnimTimer();
-    raiseTopmost();
 }
 
 static void sampleNow() {
@@ -305,7 +311,6 @@ static void sampleNow() {
     g_snap = std::move(s);
     g_vm = Reduce(g_snap, g_cfg);
     applyPollTimer();
-    applyTrayMirror();
     present();
     applyVisibility();
     applyAnimTimer();
@@ -374,17 +379,20 @@ static void ensureTopmost() {
     if (g_hwnd && IsWindowVisible(g_hwnd) && capsuleBelowTray()) raiseTopmost();
 }
 
-static void CALLBACK onTrayEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD) {
-    if (!hwnd || !g_hwnd) return;
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (tray && (hwnd == tray || IsChild(tray, hwnd))) applyTrayMirror();
-}
-
 static void CALLBACK onZEvent(HWINEVENTHOOK, DWORD, HWND, LONG idObject, LONG, DWORD, DWORD) {
     // 实测 explorer 重排事件 idObject 可能是 OBJID_CLIENT(-4) 等，不按对象过滤；
     // ensureTopmost 内部自带“真的被压住才动手”的判定，回调本身零开销。
     (void)idObject;
     ensureTopmost();
+}
+
+// 任务栏显隐/滑入滑出（自动隐藏）→ 立即跟随，不等 2s 轮询
+static void CALLBACK onTrayEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DWORD, DWORD) {
+    // explorer 重启后任务栏句柄会变：按窗口类重新绑定，而不是只认缓存句柄
+    if (!isTrayClass(hwnd)) return;
+    g_tray = hwnd;
+    followTray();
+    if (IsWindowVisible(g_hwnd)) raiseTopmost();
 }
 
 static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -417,20 +425,12 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 } else {
                     render(); // 仅重绘呼吸相位，不重锚定/不重读注册表
                 }
-            } else if (wp == IDT_TRAY) {
-                applyTrayMirror();   // 任务栏自动隐藏滑出/滑入 → 同步显隐
-                ensureTopmost();     // 滑出时任务栏会抢占 topmost，立即拉回
             } else if (wp == IDT_LIFE) {
                 bool host = adapters::IsHostRunning();
                 if (host != g_snap.hostPresent) {
                     sampleNow(); // 宿主出现/退出 → 立即重采
                 } else {
-                    int ox = g_x, oy = g_y, ow = g_capsuleW, oh = g_capsuleH;
-                    g_capsuleW = measureWidth();
-                    anchor();
-                    if (g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
-                    applyVisibility();
-                    applyAnimTimer();
+                    followTray();
                     // 任务栏/托盘气泡等 topmost 窗口重排会把胶囊压回任务栏下方 → 每 2s 重申置顶
                     if (IsWindowVisible(g_hwnd)) raiseTopmost();
                 }
@@ -448,12 +448,10 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, IDT_POLL);
             KillTimer(hwnd, IDT_LIFE);
             KillTimer(hwnd, IDT_ANIM);
-            KillTimer(hwnd, IDT_TRAY);
             g_animOn = false;
             if (g_hookFg) UnhookWinEvent(g_hookFg);
             if (g_hookRe) UnhookWinEvent(g_hookRe);
-            if (g_hookTrayShow) UnhookWinEvent(g_hookTrayShow);
-            if (g_hookTrayHide) UnhookWinEvent(g_hookTrayHide);
+            if (g_hookTray) UnhookWinEvent(g_hookTray);
             PostQuitMessage(0);
             return 0;
     }
@@ -490,21 +488,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                              nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return 1;
 
-    g_trayShown = trayShown();
     sampleNow(); // 首采：决定是否显示
     SetTimer(g_hwnd, IDT_LIFE, 2000, nullptr);
-    SetTimer(g_hwnd, IDT_TRAY, 80, nullptr); // 自动隐藏轮询兜底（钩子未触发的场景）
 
     // z序守护：被任务栏重排压下时立即（毫秒级）拉回，2s LIFE 仅作兜底
     g_hookFg = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
                                nullptr, onZEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
     g_hookRe = SetWinEventHook(EVENT_OBJECT_REORDER, EVENT_OBJECT_REORDER,
                                nullptr, onZEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
-    // 任务栏显隐：自动隐藏滑出/滑入时立即镜像（80ms 轮询仅兜底）
-    g_hookTrayShow = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
-                                     nullptr, onTrayEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
-    g_hookTrayHide = SetWinEventHook(EVENT_OBJECT_HIDE, EVENT_OBJECT_HIDE,
-                                     nullptr, onTrayEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+    // 任务栏显隐/移动（含自动隐藏滑入滑出）：立即同步胶囊显隐与位置
+    g_tray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    g_hookTray = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE,
+                                 nullptr, onTrayEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
