@@ -169,13 +169,11 @@ Snapshot ReadRegistrySnapshot() {
             for (;;) {
                 DWORD n = 256;
                 if ( RegEnumValueW(k, idx++, name, &n, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
-                DWORD type = 0, size = 0;
-                if (RegQueryValueExW(k, name, nullptr, &type, nullptr, &size) != ERROR_SUCCESS || type != REG_SZ) continue;
-                std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, 0);
-                if (RegQueryValueExW(k, name, nullptr, &type, reinterpret_cast<LPBYTE>(buf.data()), &size) != ERROR_SUCCESS) continue;
+                std::wstring v;
+                if (!readSz(k, name, v)) continue; // 仅 REG_SZ/REG_EXPAND_SZ
                 DeviceReading r;
                 int pct = 0; bool chg = false; long long ts = 0;
-                if (ParseHeadsetValue(toUtf8(buf.data()), pct, chg, ts)) {
+                if (ParseHeadsetValue(toUtf8(v), pct, chg, ts)) {
                     r.displayName = toUtf8(name); // deviceId 作为身份与显示
                     r.deviceKey = r.displayName;
                     r.percent = pct;

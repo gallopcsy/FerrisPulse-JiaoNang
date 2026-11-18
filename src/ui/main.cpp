@@ -5,7 +5,6 @@
 #define UNICODE
 #endif
 #include <windows.h>
-#include <windowsx.h>
 #include <gdiplus.h>
 #include <string>
 #include <cstdio>
@@ -224,13 +223,18 @@ static void applyPollTimer() {
     }
 }
 
+// 重申置顶：不移动、不激活、不参与 z 序链重排（显示/兜底/事件守护三处复用）
+static void raiseTopmost() {
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
 static void applyVisibility() {
     bool want = g_vm.visible;
     bool is = IsWindowVisible(g_hwnd) != 0;
     if (want && !is) {
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        raiseTopmost();
     } else if (!want && is) {
         ShowWindow(g_hwnd, SW_HIDE);
     }
@@ -324,9 +328,7 @@ static bool capsuleBelowTray() {
 }
 
 static void ensureTopmost() {
-    if (!g_hwnd || !IsWindowVisible(g_hwnd) || !capsuleBelowTray()) return;
-    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    if (g_hwnd && IsWindowVisible(g_hwnd) && capsuleBelowTray()) raiseTopmost();
 }
 
 static void CALLBACK onZEvent(HWINEVENTHOOK, DWORD, HWND, LONG idObject, LONG, DWORD, DWORD) {
@@ -377,11 +379,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
                     applyVisibility();
                     applyAnimTimer();
-                    if (IsWindowVisible(g_hwnd)) {
-                        // 任务栏/托盘气泡等 topmost 窗口重排会把胶囊压回任务栏下方 → 每 2s 重申置顶
-                        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-                    }
+                    // 任务栏/托盘气泡等 topmost 窗口重排会把胶囊压回任务栏下方 → 每 2s 重申置顶
+                    if (IsWindowVisible(g_hwnd)) raiseTopmost();
                 }
             }
             return 0;

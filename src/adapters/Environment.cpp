@@ -51,6 +51,13 @@ BOOL CALLBACK findMainWindow(HWND hwnd, LPARAM lp) {
     return FALSE;
 }
 
+HKEY openRunKey(REGSAM sam) {
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                      0, sam, &k) != ERROR_SUCCESS) return nullptr;
+    return k;
+}
 } // namespace
 
 bool IsHostRunning() { return hostPid() != 0; }
@@ -74,10 +81,8 @@ void ToggleHostWindow() {
 }
 
 bool IsAutostartOn() {
-    HKEY k = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                      0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+    HKEY k = openRunKey(KEY_READ);
+    if (!k) return false;
     DWORD type = 0, size = 0;
     LONG st = RegQueryValueExW(k, L"设备任务栏胶囊", nullptr, &type, nullptr, &size);
     RegCloseKey(k);
@@ -85,10 +90,8 @@ bool IsAutostartOn() {
 }
 
 void SetAutostart(bool on) {
-    HKEY k = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                      L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-                      0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+    HKEY k = openRunKey(KEY_SET_VALUE);
+    if (!k) return;
     const wchar_t* valName = L"设备任务栏胶囊";
     if (on) {
         std::wstring data = L"\"" + exePath() + L"\"";

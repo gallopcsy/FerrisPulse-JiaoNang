@@ -33,6 +33,25 @@ bool betterOf(const DeviceReading& a, const DeviceReading& b) {
     return a.timestamp > b.timestamp; // 未知(0)视为最旧
 }
 
+// 纯数字解析（避免 std::stoi/stoll 的异常机制，减小二进制约 4KB）
+bool parseInt64(const std::string& s, long long& out) {
+    size_t i = 0;
+    while (i < s.size() && s[i] == ' ') ++i;
+    bool neg = false;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; ++i; }
+    long long v = 0;
+    size_t digits = 0;
+    for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; ++i, ++digits) {
+        if (v > (9223372036854775807LL - 9) / 10) return false; // 溢出保护
+        v = v * 10 + (s[i] - '0');
+    }
+    if (!digits) return false;
+    while (i < s.size() && s[i] == ' ') ++i;
+    if (i != s.size()) return false;
+    out = neg ? -v : v;
+    return true;
+}
+
 } // namespace
 
 ViewModel Reduce(const Snapshot& snap, const Config& cfg) {
@@ -129,19 +148,17 @@ bool ParseHeadsetValue(const std::string& value, int& percent, bool& charging, l
     if (p1 == std::string::npos) return false;
     const size_t p2 = value.find('|', p1 + 1);
     if (p2 == std::string::npos) return false;
-    try {
-        percent = std::stoi(value.substr(0, p1));
-        const int c = std::stoi(value.substr(p1 + 1, p2 - p1 - 1));
-        const long long ticks = std::stoll(value.substr(p2 + 1));
-        if (percent < 0 || percent > 100) return false;
-        if (ticks <= 0) return false;
-        charging = (c != 0);
-        // .NET ticks: 100ns since 0001-01-01；epoch(1970) = 62135596800s
-        timestamp = ticks / 10000000LL - 62135596800LL;
-        return true;
-    } catch (...) {
+    long long p = 0, c = 0, ticks = 0;
+    if (!parseInt64(value.substr(0, p1), p) ||
+        !parseInt64(value.substr(p1 + 1, p2 - p1 - 1), c) ||
+        !parseInt64(value.substr(p2 + 1), ticks))
         return false;
-    }
+    if (p < 0 || p > 100 || ticks <= 0) return false;
+    percent = (int)p;
+    charging = (c != 0);
+    // .NET ticks: 100ns since 0001-01-01；epoch(1970) = 62135596800s
+    timestamp = ticks / 10000000LL - 62135596800LL;
+    return true;
 }
 
 } // namespace capsule
