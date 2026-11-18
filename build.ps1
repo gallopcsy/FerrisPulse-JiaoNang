@@ -29,12 +29,13 @@ if ($LASTEXITCODE -ne 0) { Write-Error 'test build failed'; exit $LASTEXITCODE }
 if ($LASTEXITCODE -ne 0) { Write-Error "tests FAILED ($LASTEXITCODE)"; exit $LASTEXITCODE }
 
 # 2) 主程序（绿色单文件：静态链接、无控制台、裁剪符号）
+# 注意：g++ 走 ANSI 参数，中文输出路径会被转码破坏 → 先输出 ASCII 名再改名
 $srcs = @('src\ui\main.cpp', 'src\adapters\RegistryReader.cpp', 'src\adapters\Environment.cpp', 'src\core\CapsuleCore.cpp')
 $libs = @('-lgdiplus', '-lgdi32', '-lmsimg32', '-lshell32', '-ladvapi32', '-luser32', '-lole32')
 & $gxx @cxx -Os -municode -mwindows -static -s -flto '-Wl,--gc-sections' -Isrc -o 'bin\capsule.exe' @srcs @libs
 if ($LASTEXITCODE -ne 0) { Write-Error 'exe build failed'; exit $LASTEXITCODE }
 
 $out = Join-Path $PSScriptRoot 'bin\设备任务栏胶囊.exe'
-if (Test-Path $out) { Remove-Item $out -Force }
-Rename-Item 'bin\capsule.exe' '设备任务栏胶囊.exe'
+Move-Item 'bin\capsule.exe' $out -Force
 Write-Host ("BUILD OK  ->  {0}  ({1:N0} bytes)" -f $out, (Get-Item $out).Length)
+
