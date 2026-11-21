@@ -81,13 +81,9 @@ static bool isTrayClass(HWND hwnd) {
 //   3) SetWindowLongPtrW(GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)   ← 必须先切 CHILD
 //   4) SetParent(hwnd, tray)                                          ← 再 SetParent
 // 顺序反了（先 SetParent 再切样式）只会得到 owner 关系，胶囊仍被面板遮挡。
-// 挂成任务栏子窗口（唯一形态，无 overlay 兜底——overlay 会被任务栏覆盖，不具兜底价值）。
-// 实证关键点：
-//  1) 必须先去掉 WS_EX_TOPMOST，否则 SetParent 静默失败
-//  2) 必须先切 WS_CHILD，再 SetParent（顺序反了只得到 owner 关系）
-//  3) 窗口若处于「已显示」状态，SetParent 会返回 ERROR_ALREADY_EXISTS(183) 而失败
-//     → 先 SW_HIDE，挂载成功后再显示
-// 挂载失败时保持隐藏，由 LIFE 定时器持续重试；绝不退回顶层窗口。
+// 挂成任务栏子窗口（唯一形态，无 overlay 兜底：顶层窗口会被任务栏覆盖）。
+// 顺序固定且不可换：去 TOPMOST → 切 WS_CHILD → SetParent；已显示的窗口必须先 SW_HIDE，
+// 否则 SetParent 返回 ERROR_ALREADY_EXISTS(183)。失败则保持隐藏，由 LIFE 定时器重试。
 static bool attachToTray() {
     refreshTray();
     if (!g_tray || !IsWindow(g_hwnd)) return false;
@@ -405,7 +401,7 @@ static bool trayOnScreen() {
                       : (vw >= 8 && vw * 3 >= tw);  // 垂直任务栏
 }
 
-// 像素回采：内部画的期望色与屏幕实际像素差太多 ⇒ 被合成层挡住
+// 胶囊可见性：宿主在跑 + 非垂直任务栏 + 任务栏真的露在屏上 + 已挂成子窗口
 static void applyVisibility() {
     const bool want = g_vm.visible && !g_trayVertical && trayOnScreen();
     const bool is = IsWindowVisible(g_hwnd) != 0;
@@ -418,7 +414,7 @@ static void applyVisibility() {
         ShowWindow(g_hwnd, SW_HIDE);
         if (g_hitHwnd && IsWindowVisible(g_hitHwnd)) ShowWindow(g_hitHwnd, SW_HIDE);
     } else if (want && is && g_hitHwnd && !IsWindowVisible(g_hitHwnd)) {
-        syncHitWindow(g_capsuleW, g_capsuleH);
+        syncHitWindow(g_capsuleW, g_capsuleH);   // 渲染窗可见但命中窗丢了 → 补同步
     }
 }
 
