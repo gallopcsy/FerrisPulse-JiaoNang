@@ -7,6 +7,8 @@
 #include <windows.h>
 #include <gdiplus.h>
 #include <string>
+#include <vector>
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
 #include "core/CapsuleCore.h"
@@ -15,24 +17,44 @@
 
 using namespace capsule;
 
-static HWND g_hwnd = nullptr;
 static Config g_cfg;
 static Snapshot g_snap;
 static ViewModel g_vm;
+
+// ── 每个任务栏一份实例（主屏 Shell_TrayWnd + 各副屏 Shell_SecondaryTrayWnd）──
+// 渲染窗 = 该任务栏的 WS_CHILD 子窗口（排在 XAML 合成层之上）；
+// 交互窗 = 对应的顶层分层窗（子窗口收不到鼠标消息，必须分离）。
+struct Capsule {
+    HWND bar = nullptr;       // 所属任务栏（主/副）
+    HWND render = nullptr;    // 渲染子窗口
+    HWND hit = nullptr;       // 交互窗口
+    bool child = false;       // render 是否已成功挂成子窗口
+    POINT clientPos{0, 0};    // render 在任务栏客户区的坐标
+    int x = -10000, y = -10000;   // 屏幕坐标（交互窗定位用）
+    bool vertical = false;    // 垂直任务栏
+};
+
+static Capsule g_main;              // 主屏
+static std::vector<Capsule> g_mirrors;  // 副屏
+
+// 兼容旧代码的别名（主实例）
+#define g_hwnd      (g_main.render)
+#define g_hitHwnd   (g_main.hit)
+#define g_child     (g_main.child)
+#define g_clientPos (g_main.clientPos)
+#define g_x         (g_main.x)
+#define g_y         (g_main.y)
+#define g_trayVertical (g_main.vertical)
+
+static HWND g_tray = nullptr;   // 主任务栏缓存
 static int g_capsuleW = 240, g_capsuleH = 32;
-static int g_x = -10000, g_y = -10000;
-// 内容命中盒（屏幕坐标窗口内相对值）：盒外 WM_NCHITTEST 返回 HTTRANSPARENT，点击落到下层任务栏图标
+static bool g_hover = false;    // 鼠标悬停在胶囊上（画一层淡淡的高亮）
+// Win10 任务栏：任务按钮在 ReBarWindow32 里，且无 Win11 的合成层桥。
+// Win11 是 XAML 岛（有 DesktopWindowContentBridge），无需避让。
+static HWND g_rebar = nullptr;
+// 内容命中盒（窗口内相对值）：盒外点击穿透到任务栏图标
 static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
-// 任务栏显隐/移动的 WinEvent 钩子
 static HWINEVENTHOOK g_hookTray = nullptr;
-// 任务栏窗口缓存 + 朝向（垂直任务栏放不下胶囊，直接隐藏而不是错位）
-static HWND g_tray = nullptr;
-static bool g_trayVertical = false;
-// SetParent 方案：渲染窗口挂成任务栏子窗口（排在 XAML 合成层之上，不被面板遮挡）；
-// 交互窗口是独立顶层分层窗（子窗口收不到鼠标消息，必须分离）。
-static bool g_child = false;
-static POINT g_clientPos{0, 0};
-static HWND g_hitHwnd = nullptr;
 
 // ── DPI 缩放 ───────────────────────────────────────────────────────
 // 进程是 PER_MONITOR_AWARE_V2：所有尺寸用物理像素。设计稿按 96 DPI(=100%) 绘制，
@@ -84,39 +106,54 @@ static bool isTrayClass(HWND hwnd) {
 // 挂成任务栏子窗口（唯一形态，无 overlay 兜底：顶层窗口会被任务栏覆盖）。
 // 顺序固定且不可换：去 TOPMOST → 切 WS_CHILD → SetParent；已显示的窗口必须先 SW_HIDE，
 // 否则 SetParent 返回 ERROR_ALREADY_EXISTS(183)。失败则保持隐藏，由 LIFE 定时器重试。
-static bool attachToTray() {
-    refreshTray();
-    if (!g_tray || !IsWindow(g_hwnd)) return false;
-    if (g_child && GetParent(g_hwnd) == g_tray) return true;
+static bool attachFor(Capsule& c) {
+    if (!c.bar || !IsWindow(c.render) || !IsWindow(c.bar)) return false;
+    if (c.child && GetParent(c.render) == c.bar) return true;
 
-    const bool wasVisible = IsWindowVisible(g_hwnd) != 0;
-    if (wasVisible) ShowWindow(g_hwnd, SW_HIDE);   // ③ 隐藏后才能重挂
+    const bool wasVisible = IsWindowVisible(c.render) != 0;
+    if (wasVisible) ShowWindow(c.render, SW_HIDE);   // 已显示时 SetParent 会返回 183
 
-    LONG_PTR style = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
-    LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TOPMOST);          // ① 去置顶
-    SetWindowLongPtrW(g_hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD); // ② 先切子窗口
-    SetParent(g_hwnd, g_tray);                                            //   再挂父窗口
+    LONG_PTR style = GetWindowLongPtrW(c.render, GWL_STYLE);
+    LONG_PTR ex = GetWindowLongPtrW(c.render, GWL_EXSTYLE);
+    SetWindowLongPtrW(c.render, GWL_EXSTYLE, ex & ~WS_EX_TOPMOST);          // ① 去置顶
+    SetWindowLongPtrW(c.render, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD); // ② 先切子窗口
+    SetParent(c.render, c.bar);                                             //   再挂父窗口
 
-    const bool ok = (GetParent(g_hwnd) == g_tray);
-    g_child = ok;
-    // 失败：样式已是 CHILD 但未挂上 → 仍保持子窗口样式并隐藏，等下次重试。
-    // （不回退 WS_POPUP/WS_EX_TOPMOST：那等于退回会被遮挡的 overlay）
-    if (ok && wasVisible) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    const bool ok = (GetParent(c.render) == c.bar);
+    c.child = ok;
+    if (ok && wasVisible) ShowWindow(c.render, SW_SHOWNOACTIVATE);
     return ok;
 }
 
-// 创建渲染窗口：先建成隐藏 popup，紧随其后 attachToTray() 转为任务栏子窗口。
-// 不带 WS_EX_TOPMOST —— 顶置窗口无法挂成子窗口，且 overlay 形态已被废弃。
-static bool createRenderWindow() {
-    HINSTANCE inst = GetModuleHandleW(nullptr);
-    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-                             L"DeviceTaskbarCapsuleWnd", L"",
-                             WS_POPUP, 0, 0, 10, 10,
-                             nullptr, nullptr, inst, nullptr);
-    g_child = false;
-    return g_hwnd != nullptr;
+static bool attachToTray() {
+    refreshTray();
+    g_main.bar = g_tray;
+    return attachFor(g_main);
 }
+
+// 创建一对窗口（渲染 popup + 交互窗），供主屏/副屏共用。
+// 渲染窗不带 WS_EX_TOPMOST（顶置窗口无法挂成子窗口）。
+static bool createPair(Capsule& c) {
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    if (!c.render) {
+        c.render = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+                                   L"DeviceTaskbarCapsuleWnd", L"",
+                                   WS_POPUP, 0, 0, 10, 10,
+                                   nullptr, nullptr, inst, nullptr);
+        if (!c.render) return false;
+    }
+    if (!c.hit) {
+        c.hit = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
+                                L"DeviceTaskbarCapsuleHitWnd", L"",
+                                WS_POPUP, 0, 0, 10, 10,
+                                nullptr, nullptr, inst, nullptr);
+    }
+    c.child = false;
+    return c.hit != nullptr;
+}
+
+// 主实例便捷封装
+static bool createRenderWindow() { return createPair(g_main); }
 
 // 单实例互斥（自重启时需要先释放，否则新进程会被挡掉）
 static HANDLE g_mtx = nullptr;
@@ -198,42 +235,90 @@ static int measureWidth() {
     return w;
 }
 
-// 锚定：Shell_TrayWnd → TrayNotifyWnd 左缘 -8 右对齐；垂直居中
-// 只支持水平任务栏（上/下）：垂直任务栏宽度不足以放下胶囊，由 applyVisibility 隐藏。
-static void anchor() {
-    refreshTray();
-    if (!g_tray) return;
+// 锚定：任意任务栏 → 其托盘区左缘 -inset 右对齐；垂直居中。
+// 只支持水平任务栏（上/下）：垂直任务栏宽度不足，由 applyVisibility 隐藏。
+static void anchorFor(Capsule& c) {
+    if (!c.bar || !IsWindow(c.bar)) return;
     RECT tr{};
-    if (!GetWindowRect(g_tray, &tr)) return;
-    g_trayVertical = (tr.bottom - tr.top) > (tr.right - tr.left);
-    if (g_trayVertical) return;
-    LONG right = tr.right - 340; // 回退：任务栏右缘内收
-    HWND tn = FindWindowExW(g_tray, nullptr, L"TrayNotifyWnd", nullptr);
+    if (!GetWindowRect(c.bar, &tr)) return;
+    c.vertical = (tr.bottom - tr.top) > (tr.right - tr.left);
+    if (c.vertical) return;
+    LONG right = tr.right - 340;   // 回退：任务栏右缘内收
+    HWND tn = FindWindowExW(c.bar, nullptr, L"TrayNotifyWnd", nullptr);
     if (tn) {
         RECT r{};
         if (GetWindowRect(tn, &r)) right = r.left;
     }
-    refreshDpiScale();   // 任务栏可能跨屏移动过，重新取当前显示器 DPI
-    const float s = g_scale;
+    // 每个任务栏按其所在显示器取 DPI
+    UINT dpi = c.render ? GetDpiForWindow(c.render) : 96;
+    if (dpi == 0) dpi = 96;
+    const float s = (float)dpi / 96.0f;
+    if (&c == &g_main) { g_scale = s; refreshDpiScale(); }   // 主实例维护全局缩放
+
     int taskH = tr.bottom - tr.top;
-    g_capsuleH = taskH - (int)(metrics::kTaskbarPad * s);
+    int h = taskH - (int)(metrics::kTaskbarPad * s);
     const int minH = (int)(metrics::kMinH * s);
     const int maxH = (int)(metrics::kMaxH * s);
-    if (g_capsuleH < minH) g_capsuleH = minH;
-    if (g_capsuleH > maxH) g_capsuleH = maxH;
-    g_y = tr.top + (taskH - g_capsuleH) / 2;
-    g_x = right - (int)(metrics::kEdgeInset * s) - g_capsuleW;
-    POINT p{g_x, g_y};
-    if (ScreenToClient(g_tray, &p)) g_clientPos = p; // 子窗口用客户区坐标
+    if (h < minH) h = minH;
+    if (h > maxH) h = maxH;
+    if (&c == &g_main) g_capsuleH = h;
+    c.y = tr.top + (taskH - h) / 2;
+    c.x = right - (int)(metrics::kEdgeInset * s) - g_capsuleW;
+    POINT p{c.x, c.y};
+    if (ScreenToClient(c.bar, &p)) c.clientPos = p;
+}
+
+static void anchor() { anchorFor(g_main); }
+
+// Win10 适配：任务按钮容器（ReBarWindow32）默认占满任务栏剩余宽度，
+// 会盖住/挤压右侧的胶囊。这里把它的宽度收窄到胶囊左缘，给它让出空间。
+// Win11 无 ReBarWindow32（任务栏是 XAML 岛），本函数自动跳过。
+static void avoidRebarOnWin10() {
+    refreshTray();
+    if (!g_tray || !g_main.render) return;
+    // Win11 判据：任务栏里有 XAML 合成层桥（DesktopWindowContentBridge）。
+    // 注意 Win11 也可能残留 ReBarWindow32，因此不能靠 rebar 是否存在来判断系统版本。
+    if (FindWindowExW(g_tray, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr)) {
+        g_rebar = nullptr;
+        return;
+    }
+    if (!g_rebar || !IsWindow(g_rebar))
+        g_rebar = FindWindowExW(g_tray, nullptr, L"ReBarWindow32", nullptr);
+    if (!g_rebar) return;
+
+    RECT rb{}, tb{};
+    if (!GetClientRect(g_rebar, &rb) || !GetWindowRect(g_tray, &tb)) return;
+    // 目标宽度：胶囊左缘相对任务栏客户区的 x
+    POINT p{g_main.x, 0};
+    if (!ScreenToClient(g_tray, &p)) return;
+    const int wantW = p.x < 0 ? 0 : p.x;
+    if (wantW > 0 && wantW != rb.right)
+        SetWindowPos(g_rebar, nullptr, 0, 0, wantW, rb.bottom,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// 枚举所有「有托盘区」的水平副屏任务栏
+static std::vector<HWND> secondaryBars() {
+    std::vector<HWND> out;
+    for (HWND t = FindWindowExW(nullptr, nullptr, L"Shell_SecondaryTrayWnd", nullptr); t;
+         t = FindWindowExW(nullptr, t, L"Shell_SecondaryTrayWnd", nullptr)) {
+        if (!IsWindowVisible(t)) continue;
+        RECT r{};
+        if (!GetWindowRect(t, &r)) continue;
+        if (r.right - r.left <= r.bottom - r.top) continue;   // 只要水平任务栏
+        if (!FindWindowExW(t, nullptr, L"TrayNotifyWnd", nullptr)) continue;  // 无托盘区则跳过
+        out.push_back(t);
+    }
+    return out;
 }
 
 // 交互窗口：与胶囊同位置同尺寸；内容盒 alpha=1（1/255，肉眼不可见但可命中），
 // 盒外 alpha=0 → 点击穿透到任务栏图标。渲染窗是子窗口、收不到鼠标，点击全靠它。
-static void syncHitWindow(int W, int H) {
-    if (!g_hitHwnd) return;
-    const bool vis = IsWindowVisible(g_hwnd) != 0;
+static void syncHitFor(Capsule& c, int W, int H) {
+    if (!c.hit || !c.render) return;
+    const bool vis = IsWindowVisible(c.render) != 0;
     if (!vis) {
-        if (IsWindowVisible(g_hitHwnd)) ShowWindow(g_hitHwnd, SW_HIDE);
+        if (IsWindowVisible(c.hit)) ShowWindow(c.hit, SW_HIDE);
         return;
     }
     Gdiplus::Bitmap hit(W, H, PixelFormat32bppPARGB);
@@ -249,22 +334,25 @@ static void syncHitWindow(int W, int H) {
         if (hit.GetHBITMAP(Gdiplus::Color(0, 0, 0, 0), &hb) == Gdiplus::Ok && hb) {
             HDC mdc = CreateCompatibleDC(nullptr);
             HGDIOBJ old = SelectObject(mdc, hb);
-            POINT src{0, 0}, dst{g_x, g_y};
+            POINT src{0, 0}, dst{c.x, c.y};
             SIZE sz{W, H};
             BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-            UpdateLayeredWindow(g_hitHwnd, nullptr, &dst, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+            UpdateLayeredWindow(c.hit, nullptr, &dst, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
             SelectObject(mdc, old);
             DeleteDC(mdc);
             DeleteObject(hb);
         }
     }
-    if (!IsWindowVisible(g_hitHwnd)) ShowWindow(g_hitHwnd, SW_SHOWNOACTIVATE);
-    SetWindowPos(g_hitHwnd, HWND_TOPMOST, g_x, g_y, W, H,
+    if (!IsWindowVisible(c.hit)) ShowWindow(c.hit, SW_SHOWNOACTIVATE);
+    SetWindowPos(c.hit, HWND_TOPMOST, c.x, c.y, W, H,
                  SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
 }
 
+static void syncHitWindow(int W, int H) { syncHitFor(g_main, W, H); }
+
 // GDI+ 渲染 → 分层窗口呈现
-static void render() {
+static void renderFor(Capsule& c) {
+    if (!c.render) return;
     const int W = g_capsuleW, H = g_capsuleH;
     if (W <= 0 || H <= 0) return;
 
@@ -291,6 +379,14 @@ static void render() {
     Gdiplus::SolidBrush outlineBr(Gdiplus::Color(0xD0, 0xFF, 0xFF, 0xFF));
     Gdiplus::SolidBrush pctBr(g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xD7, 0x00, 0x15)
                                               : Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
+
+    // 悬停：画一层极淡的圆角底板，给出"可点击"的视觉反馈
+    if (g_hover && &c == &g_main) {
+        Gdiplus::GraphicsPath plate;
+        roundRectPath(plate, 0.5f, 0.5f, W - 1.0f, H - 1.0f, 6.0f * s);
+        Gdiplus::SolidBrush plateBr(Gdiplus::Color(0x1A, 0x00, 0x00, 0x00));
+        gr.FillPath(&plateBr, &plate);
+    }
 
     float y = (H - textH) / 2.0f;
     float x = padX;
@@ -358,18 +454,71 @@ static void render() {
     HGDIOBJ old = SelectObject(mem, hBmp);
 
     POINT ptSrc{0, 0};
-    POINT ptDst{g_x, g_y};
-    if (g_child) ptDst = g_clientPos;
+    POINT ptDst{c.x, c.y};
+    if (c.child) ptDst = c.clientPos;
     SIZE sz{W, H};
-    syncHitWindow(W, H);
+    syncHitFor(c, W, H);
     // 字段序：{BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat}
     // AlphaFormat 必须 = AC_SRC_ALPHA 才启用逐像素混合（否则整窗按不透明拷贝，透明区变纯黑）
     BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(g_hwnd, nullptr, &ptDst, &sz, mem, &ptSrc, 0, &bf, ULW_ALPHA);
+    UpdateLayeredWindow(c.render, nullptr, &ptDst, &sz, mem, &ptSrc, 0, &bf, ULW_ALPHA);
 
     SelectObject(mem, old);
     DeleteDC(mem);
     DeleteObject(hBmp);
+}
+
+static void render() { renderFor(g_main); }
+
+// ── 副屏镜像 ─────────────────────────────────────────────────────
+// 每块副屏任务栏一份胶囊，与主屏同步显隐/内容。约每秒调一次（由 IDT_LIFE 驱动）。
+static void destroyMirror(Capsule& c) {
+    if (c.hit && IsWindow(c.hit)) DestroyWindow(c.hit);
+    if (c.render && IsWindow(c.render)) DestroyWindow(c.render);
+    c = Capsule{};
+}
+
+static void syncMirrors(bool visible) {
+    if (!visible) {                      // 主屏不可见 → 全部镜像也隐藏
+        for (auto& m : g_mirrors) {
+            if (m.render && IsWindowVisible(m.render)) ShowWindow(m.render, SW_HIDE);
+            if (m.hit && IsWindowVisible(m.hit)) ShowWindow(m.hit, SW_HIDE);
+        }
+        return;
+    }
+
+    const std::vector<HWND> bars = secondaryBars();
+
+    // 清理：任务栏消失 或 窗口没了
+    for (auto it = g_mirrors.begin(); it != g_mirrors.end();) {
+        const bool barGone = std::find(bars.begin(), bars.end(), it->bar) == bars.end();
+        if (barGone || !IsWindow(it->render)) { destroyMirror(*it); it = g_mirrors.erase(it); }
+        else ++it;
+    }
+
+    // 新增：为每块新副屏建一对窗口
+    for (HWND b : bars) {
+        bool exists = false;
+        for (const auto& m : g_mirrors) if (m.bar == b) { exists = true; break; }
+        if (exists) continue;
+        Capsule c;
+        c.bar = b;
+        if (createPair(c) && attachFor(c)) g_mirrors.push_back(c);
+        else destroyMirror(c);
+    }
+
+    // 定位 + 绘制
+    for (auto& m : g_mirrors) {
+        anchorFor(m);
+        if (m.vertical) {                 // 垂直副屏任务栏：不显示
+            if (m.render && IsWindowVisible(m.render)) ShowWindow(m.render, SW_HIDE);
+            continue;
+        }
+        if (!m.child) attachFor(m);
+        if (!m.child) continue;
+        if (!IsWindowVisible(m.render)) ShowWindow(m.render, SW_SHOWNOACTIVATE);
+        renderFor(m);
+    }
 }
 
 static void applyPollTimer() {
@@ -438,6 +587,9 @@ static void layout(bool force) {
     if (force || g_x != ox || g_y != oy || g_capsuleW != ow || g_capsuleH != oh) render();
     applyVisibility();
     applyAnimTimer();
+    avoidRebarOnWin10();   // Win10 任务栏任务按钮避让（Win11 自动跳过）
+    // 副屏镜像：跟随主屏的可见性与内容
+    syncMirrors(g_vm.visible && !g_trayVertical && trayOnScreen());
 }
 
 static void sampleNow() {
@@ -548,6 +700,18 @@ static LRESULT CALLBACK hitProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_NCHITTEST:
             return HTCLIENT;
+        case WM_MOUSEMOVE: {
+            if (!g_hover) {
+                g_hover = true;
+                TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, hwnd, 0};
+                TrackMouseEvent(&t);
+                render();   // 重绘一次显示高亮
+            }
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            if (g_hover) { g_hover = false; render(); }
+            return 0;
         case WM_LBUTTONDOWN:
             adapters::ToggleHostWindow();
             return 0;
@@ -672,14 +836,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     hc.lpszClassName = L"DeviceTaskbarCapsuleHitWnd";
     RegisterClassExW(&hc);
 
+    // 一次性创建主实例的渲染窗 + 交互窗（createPair 内部去重）
     if (!createRenderWindow()) return 1;
-
-    // 交互窗口：独立顶层分层窗（子窗口收不到鼠标消息）
-    g_hitHwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
-                                hc.lpszClassName, L"",
-                                WS_POPUP,
-                                0, 0, 10, 10,
-                                nullptr, nullptr, inst, nullptr);
 
     attachToTray(); // 挂成任务栏子窗口（失败时 LIFE 定时器持续重试）
     sampleNow(); // 首采：决定是否显示
