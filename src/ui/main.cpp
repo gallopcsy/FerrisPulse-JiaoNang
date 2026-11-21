@@ -81,30 +81,40 @@ static bool isTrayClass(HWND hwnd) {
 //   3) SetWindowLongPtrW(GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD)   ← 必须先切 CHILD
 //   4) SetParent(hwnd, tray)                                          ← 再 SetParent
 // 顺序反了（先 SetParent 再切样式）只会得到 owner 关系，胶囊仍被面板遮挡。
+// 挂成任务栏子窗口（唯一形态，无 overlay 兜底——overlay 会被任务栏覆盖，不具兜底价值）。
+// 实证关键点：
+//  1) 必须先去掉 WS_EX_TOPMOST，否则 SetParent 静默失败
+//  2) 必须先切 WS_CHILD，再 SetParent（顺序反了只得到 owner 关系）
+//  3) 窗口若处于「已显示」状态，SetParent 会返回 ERROR_ALREADY_EXISTS(183) 而失败
+//     → 先 SW_HIDE，挂载成功后再显示
+// 挂载失败时保持隐藏，由 LIFE 定时器持续重试；绝不退回顶层窗口。
 static bool attachToTray() {
     refreshTray();
-    if (!g_tray || !g_hwnd) return false;
+    if (!g_tray || !IsWindow(g_hwnd)) return false;
     if (g_child && GetParent(g_hwnd) == g_tray) return true;
+
+    const bool wasVisible = IsWindowVisible(g_hwnd) != 0;
+    if (wasVisible) ShowWindow(g_hwnd, SW_HIDE);   // ③ 隐藏后才能重挂
 
     LONG_PTR style = GetWindowLongPtrW(g_hwnd, GWL_STYLE);
     LONG_PTR ex = GetWindowLongPtrW(g_hwnd, GWL_EXSTYLE);
-    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TOPMOST);
-    SetWindowLongPtrW(g_hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD);
-    SetParent(g_hwnd, g_tray);
+    SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex & ~WS_EX_TOPMOST);          // ① 去置顶
+    SetWindowLongPtrW(g_hwnd, GWL_STYLE, (style & ~WS_POPUP) | WS_CHILD); // ② 先切子窗口
+    SetParent(g_hwnd, g_tray);                                            //   再挂父窗口
 
-    if (GetParent(g_hwnd) != g_tray) {   // 未挂上 → 还原，稍后重试
-        SetWindowLongPtrW(g_hwnd, GWL_STYLE, (style & ~WS_CHILD) | WS_POPUP);
-        SetWindowLongPtrW(g_hwnd, GWL_EXSTYLE, ex | WS_EX_TOPMOST);
-        return false;
-    }
-    g_child = true;   // 子窗口 z 序由父窗口决定，无需再置顶
-    return true;
+    const bool ok = (GetParent(g_hwnd) == g_tray);
+    g_child = ok;
+    // 失败：样式已是 CHILD 但未挂上 → 仍保持子窗口样式并隐藏，等下次重试。
+    // （不回退 WS_POPUP/WS_EX_TOPMOST：那等于退回会被遮挡的 overlay）
+    if (ok && wasVisible) ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    return ok;
 }
 
-// 创建渲染窗口（popup 起步，随后 attachToTray 转成任务栏子窗口）
+// 创建渲染窗口：先建成隐藏 popup，紧随其后 attachToTray() 转为任务栏子窗口。
+// 不带 WS_EX_TOPMOST —— 顶置窗口无法挂成子窗口，且 overlay 形态已被废弃。
 static bool createRenderWindow() {
     HINSTANCE inst = GetModuleHandleW(nullptr);
-    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
+    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
                              L"DeviceTaskbarCapsuleWnd", L"",
                              WS_POPUP, 0, 0, 10, 10,
                              nullptr, nullptr, inst, nullptr);
@@ -337,11 +347,12 @@ static void render() {
     gr.DrawString(pct, -1, &fPct, Gdiplus::PointF(x + s, y + s), &outlineBr);
     gr.DrawString(pct, -1, &fPct, Gdiplus::PointF(x, y), &pctBr);
 
-    // 内容命中盒：盒外点击穿透到任务栏（透明像素不吞点击）——同样按 DPI 缩放
+    // 内容命中盒：左右按内容宽度，上下覆盖整个胶囊高度 ——
+    // 否则点击胶囊上下留白处会穿透到任务栏，弹出任务栏自己的菜单。
     g_hitL = (int)padX;
     g_hitR = (int)(x + rp.Width);
-    g_hitT = (int)y;
-    g_hitB = (int)(y + textH);
+    g_hitT = 0;
+    g_hitB = H;
 
     gr.Flush();
 
@@ -374,13 +385,6 @@ static void applyPollTimer() {
     }
 }
 
-// 重申置顶：不移动、不激活、不参与 z 序链重排（显示/兜底/事件守护三处复用）
-static void raiseTopmost() {
-    if (g_child) return; // 子窗口 z 序由父窗口决定
-    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-}
-
 // 任务栏「实际露在屏幕上」判定：自动隐藏滑出屏幕后只剩 1–2px，视为隐藏。
 // 胶囊是独立窗口，任务栏滑走时它不会跟着走，必须靠这里同步隐藏/跟随。
 static bool trayOnScreen() {
@@ -406,8 +410,9 @@ static void applyVisibility() {
     const bool want = g_vm.visible && !g_trayVertical && trayOnScreen();
     const bool is = IsWindowVisible(g_hwnd) != 0;
     if (want && !is) {
+        // 只有挂成任务栏子窗口才显示；挂载失败时保持隐藏，绝不退回顶层窗口
+        if (!g_child) return;
         ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-        raiseTopmost();
         syncHitWindow(g_capsuleW, g_capsuleH);
     } else if (!want && is) {
         ShowWindow(g_hwnd, SW_HIDE);
@@ -497,13 +502,19 @@ static void showMenu() {
 
     POINT pt{};
     GetCursorPos(&pt);
-    // 关键：owner 必须是「交互窗口」(顶层)，不能用 g_hwnd。
-    // g_hwnd 是任务栏子窗口 —— 把它设为前台会把任务栏拉到前台，于是弹出的是任务栏的菜单。
+    // owner 必须是「交互窗口」(顶层)：g_hwnd 是任务栏子窗口，拿它当 owner 会把菜单
+    // 归到任务栏的 z 序 band，被开始菜单/任务栏盖住。
     HWND owner = g_hitHwnd ? g_hitHwnd : g_hwnd;
-    // 先让当前前台窗口（可能是任务栏/开始菜单）失去激活，菜单才会正常接管；
-    // 但不能 SetForegroundWindow(owner)：交互窗是 NOACTIVATE 的，强设会被拒绝并留下任务栏在前台。
+
+    // 菜单窗口的 z 序跟随 owner 的 band：开始菜单/快速设置在上层 band，
+    // 因此菜单弹出前先把 owner 抬到 topmost 最前，保证菜单整体覆盖任务栏。
+    SetWindowPos(owner, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
     SetForegroundWindow(owner);
-    UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+
+    // TPM_WORKAREA：让菜单避开任务栏区域，减少与任务栏重叠的概率。
+    UINT cmd = TrackPopupMenuEx(m,
+                                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_WORKAREA,
                                 pt.x, pt.y, owner, nullptr);
     DestroyMenu(m);
     bool freqChanged = false;
@@ -597,7 +608,6 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         attachToTray();
                     }
                     layout(false);
-                    if (!g_child && IsWindowVisible(g_hwnd)) raiseTopmost();
                 }
             }
             return 0;
