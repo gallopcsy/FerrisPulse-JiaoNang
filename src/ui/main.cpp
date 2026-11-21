@@ -497,9 +497,14 @@ static void showMenu() {
 
     POINT pt{};
     GetCursorPos(&pt);
-    SetForegroundWindow(g_hwnd); // 让菜单在别处点击时能正常关闭
+    // 关键：owner 必须是「交互窗口」(顶层)，不能用 g_hwnd。
+    // g_hwnd 是任务栏子窗口 —— 把它设为前台会把任务栏拉到前台，于是弹出的是任务栏的菜单。
+    HWND owner = g_hitHwnd ? g_hitHwnd : g_hwnd;
+    // 先让当前前台窗口（可能是任务栏/开始菜单）失去激活，菜单才会正常接管；
+    // 但不能 SetForegroundWindow(owner)：交互窗是 NOACTIVATE 的，强设会被拒绝并留下任务栏在前台。
+    SetForegroundWindow(owner);
     UINT cmd = TrackPopupMenuEx(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                                pt.x, pt.y, g_hwnd, nullptr);
+                                pt.x, pt.y, owner, nullptr);
     DestroyMenu(m);
     bool freqChanged = false;
     for (const auto& fr : kFreqs)
