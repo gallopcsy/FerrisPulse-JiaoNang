@@ -71,12 +71,19 @@ static bool attachToTray() {
     return true;
 }
 
-// explorer 重启：任务栏子窗口随旧任务栏销毁 → 用新句柄重建并重挂
-static void rebindTray() {
-    if (!g_tray) return;
-    if (g_child && g_hwnd && IsWindow(g_hwnd) && GetParent(g_hwnd) == g_tray) return;
-    attachToTray();
+// 创建渲染窗口（popup 起步，随后 attachToTray 转成任务栏子窗口）
+static bool createRenderWindow() {
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
+                             L"DeviceTaskbarCapsuleWnd", L"",
+                             WS_POPUP, 0, 0, 10, 10,
+                             nullptr, nullptr, inst, nullptr);
+    g_child = false;
+    return g_hwnd != nullptr;
 }
+
+// 单实例互斥（自重启时需要先释放，否则新进程会被挡掉）
+static HANDLE g_mtx = nullptr;
 
 // 充电呼吸动画开关（仅在「充电 + 可见」时挂 40ms 定时器，其余时刻零开销）
 static bool g_animOn = false;
@@ -397,6 +404,37 @@ static void sampleNow() {
     layout(true);
 }
 
+// 任务栏重建 / 子窗口被销毁 → 重建渲染窗并重新挂载。
+// 注意：任务栏子窗口会随旧任务栏一起销毁，句柄失效时必须重建，不能只 SetParent。
+// explorer 重启（任务栏重建）会连带销毁任务栏子窗口。
+// 实测：进程内重建的新子窗口 UpdateLayeredWindow 不出图（永远空白），
+// 因此改为「重启自己」——新进程走正常初始化流程，外观与首次启动一致。
+// 关键：旧进程必须真正退出（释放互斥并 PostQuitMessage），否则会出现双实例。
+static void restartSelf() {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    // 关键：不创建子进程，而是交给外部延时启动，避免与本进程抢互斥。
+    // 做法：先自杀（PostQuitMessage → 进程退出），再让 shell 起新实例。
+    std::wstring cmd = L"/c timeout /t 1 /nobreak >nul & start \"\" \"";
+    cmd += path;
+    cmd += L"\"";
+    wchar_t sys[MAX_PATH]{};
+    GetSystemDirectoryW(sys, MAX_PATH);
+    std::wstring exe = std::wstring(sys) + L"\\cmd.exe";
+    STARTUPINFOW si2{};
+    si2.cb = sizeof(si2);
+    si2.dwFlags = STARTF_USESHOWWINDOW;
+    si2.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi2{};
+    if (CreateProcessW(exe.c_str(), &cmd[0], nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si2, &pi2)) {
+        CloseHandle(pi2.hProcess);
+        CloseHandle(pi2.hThread);
+    }
+    if (g_mtx) { ReleaseMutex(g_mtx); CloseHandle(g_mtx); g_mtx = nullptr; }
+    PostQuitMessage(0);   // 立即退出消息循环 → 进程结束，把互斥让给新实例
+}
+
 static void showMenu() {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, ID_OPEN, L"打开FerrisPulse");
@@ -446,7 +484,8 @@ static void CALLBACK onTrayEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DW
     if (isTrayClass(hwnd)) {
         const bool newTray = (g_tray != nullptr && hwnd != g_tray);
         g_tray = hwnd;
-        if (newTray) rebindTray(); // explorer 重启 → 改挂到新任务栏
+        // explorer 重启 → 任务栏子窗口已被连带销毁 → 重启自己（进程内重建无法出图）
+        if (newTray) restartSelf();
         followTray();
         return;
     }
@@ -506,10 +545,14 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (host != g_snap.hostPresent) {
                     sampleNow(); // 宿主出现/退出 → 立即重采
                 } else {
-                    // 尚未挂成子窗口时重试（任务栏可能刚就绪）
+                    // 自愈：渲染窗被销毁（任务栏重建）→ 重启自己；尚未挂成子窗口 → 重试挂载
+                    if (!IsWindow(g_hwnd)) {
+                        restartSelf();
+                    } else if (!g_child) {
+                        attachToTray();
+                    }
                     followTray();
-                    // 任务栏/托盘气泡等 topmost 窗口重排会把胶囊压回任务栏下方 → 每 2s 重申置顶
-                    if (IsWindowVisible(g_hwnd)) raiseTopmost();
+                    if (!g_child && IsWindowVisible(g_hwnd)) raiseTopmost();
                 }
             }
             return 0;
@@ -539,8 +582,19 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     // 单实例（胶囊自身的本地互斥；与宿主的全局互斥无关）
-    HANDLE mtx = CreateMutexW(nullptr, TRUE, L"Local\\DeviceTaskbarCapsule_SingleInstance");
-    if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    g_mtx = CreateMutexW(nullptr, TRUE, L"Local\\DeviceTaskbarCapsule_SingleInstance");
+    if (g_mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
+        // 自重启场景：旧进程正在退出，等它释放互斥（最多 3 秒）
+        CloseHandle(g_mtx);
+        g_mtx = nullptr;
+        for (int i = 0; i < 30; ++i) {
+            Sleep(100);
+            g_mtx = CreateMutexW(nullptr, TRUE, L"Local\\DeviceTaskbarCapsule_SingleInstance");
+            if (g_mtx && GetLastError() != ERROR_ALREADY_EXISTS) break;
+            if (g_mtx) { CloseHandle(g_mtx); g_mtx = nullptr; }
+        }
+        if (!g_mtx) return 0;   // 旧实例仍在运行 → 本进程退出
+    }
 
     // DPI 缩放下的任务栏高度修正：读取 TaskbarSizeHint?（Win11 固定48物理px，anchor 从 TrayRect 实测）
 
@@ -562,12 +616,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     hc.lpszClassName = L"DeviceTaskbarCapsuleHitWnd";
     RegisterClassExW(&hc);
 
-    g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
-                             wc.lpszClassName, L"",
-                             WS_POPUP,
-                             0, 0, 10, 10,
-                             nullptr, nullptr, inst, nullptr);
-    if (!g_hwnd) return 1;
+    if (!createRenderWindow()) return 1;
 
     // 交互窗口：独立顶层分层窗（子窗口收不到鼠标消息）
     g_hitHwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TOPMOST,
@@ -591,7 +640,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&m);
     }
 
-    if (mtx) CloseHandle(mtx);
+    if (g_mtx) { CloseHandle(g_mtx); g_mtx = nullptr; }
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     return 0;
 }
