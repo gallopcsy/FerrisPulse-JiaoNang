@@ -8,7 +8,7 @@
 
 ![设备任务栏胶囊效果：设备名 · 进度条 · 百分比](docs/capsule.png)
 
-> **版本**：v0.2.0　|　**下载**：[Releases](https://github.com/gallopcsy/FerrisPulse-JiaoNang/releases/latest)　|　**协议**：[MIT](LICENSE)
+> **版本**：v0.2.1　|　**下载**：[Releases](https://github.com/gallopcsy/FerrisPulse-JiaoNang/releases/latest)　|　**协议**：[MIT](LICENSE)
 >
 > 更新记录与适配的 FerrisPulse 版本见 [Release 页面](https://github.com/gallopcsy/FerrisPulse-JiaoNang/releases/latest)。
 
@@ -21,14 +21,16 @@ FerrisPulse 是多设备 2.4G/蓝牙电量监视器，但看电量要开面板�
 
 ## 特性
 
-- **零竞争只读**：仅读取宿主写入的注册表缓存（`HKCU\Software\RazerBatteryTray`），
+- **零竞争只读**：蓝牙设备直读 Windows 的 BLE 电量（SetupAPI 驱动属性，与「设置→蓝牙」同源），
+  其余走宿主写入的注册表缓存（`HKCU\Software\RazerBatteryTray`）兜底——
   不开 HID、不改宿主、不注入、不 hook 它的代码。
-- **单文件极简**：静态编译、无控制台、无运行库依赖，`设备任务栏胶囊.exe` ≈ 301 KB，拷走即用。
+- **单文件极简**：静态编译、无控制台、无运行库依赖，`设备任务栏胶囊.exe` ≈ 306 KB，拷走即用。
 - **自动隐身**：宿主运行才出现；宿主退出 2 秒内消失；没有任何有效电量数据时整体隐藏——任务栏零残留。
 - **跟随任务栏**：任务栏自动隐藏时同步收起，滑出时同步出现；explorer 重启后自动重新绑定任务栏窗口。
 - **不抢焦点**：`WS_EX_NOACTIVATE` + 点击穿透（胶囊外的区域完全不拦截鼠标）。
 - **常驻置顶**：WinEvent 监听任务栏/托盘的窗口重排事件即时重申 `HWND_TOPMOST`，另有 2 秒定时兜底，
   点任务栏、开通知中心都不会把胶囊压没。
+- **DPI 自适应**：字号、进度条、间距全部按显示器 DPI 等比缩放（100%–200%），高分辨率下不再显小。
 - **低电告警**：任一可用设备电量 < 30% 时进度条变红（29 红 / 30 绿，边界有测试）。
 - **多设备取最低**：同时接入多台设备时显示"最紧急"的那台，等级冲突按数据新鲜度消解。
 - **充电呼吸**：当前显示的设备上报"充电中"时，进度条按 **2 秒周期明暗呼吸**（亮度 0.60 ↔ 1.00）；

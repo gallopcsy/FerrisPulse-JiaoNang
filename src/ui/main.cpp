@@ -34,6 +34,36 @@ static bool g_child = false;
 static POINT g_clientPos{0, 0};
 static HWND g_hitHwnd = nullptr;
 
+// ── DPI 缩放 ───────────────────────────────────────────────────────
+// 进程是 PER_MONITOR_AWARE_V2：所有尺寸用物理像素。设计稿按 96 DPI(=100%) 绘制，
+// 实际绘制时统一乘 g_scale，使 125%/150%/200% 屏幕上视觉大小一致。
+// 基准尺寸（100% 缩放下的物理像素）集中在此，绘制代码不再散落魔法数字。
+namespace metrics {
+constexpr float kFontPx     = 13.0f;  // 字号（像素，UnitPixel）
+constexpr float kPadX       = 12.0f;  // 左右内边距
+constexpr float kNameGap    = 10.0f;  // 名字 → 进度条
+constexpr float kBarW       = 76.0f;  // 进度条宽
+constexpr float kBarH       = 8.0f;   // 进度条高
+constexpr float kBarGap     = 6.0f;   // 进度条 → 百分比
+constexpr float kTextH      = 16.0f;  // 文字行高（垂直居中用）
+constexpr float kMinW       = 160.0f; // 胶囊最小/最大宽
+constexpr float kMaxW       = 420.0f;
+constexpr float kEdgeInset  = 8.0f;   // 胶囊右缘距托盘左缘
+constexpr float kTaskbarPad = 16.0f;  // 任务栏高度减去此值 = 胶囊高
+constexpr float kMinH       = 24.0f;
+constexpr float kMaxH       = 40.0f;
+} // namespace metrics
+
+static float g_scale = 1.0f;   // 当前显示器缩放系数（96 DPI = 1.0）
+
+// 取窗口所在显示器的缩放；跨屏拖动后需重算
+static void refreshDpiScale() {
+    UINT dpi = 96;
+    if (g_hwnd) dpi = GetDpiForWindow(g_hwnd);
+    if (dpi == 0) dpi = 96;
+    g_scale = (float)dpi / 96.0f;
+}
+
 // explorer 重启会重建任务栏窗口：句柄失效（或被新句柄替换）时必须重新解析
 static void refreshTray() {
     if (!g_tray || !IsWindow(g_tray)) g_tray = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -125,7 +155,7 @@ static Gdiplus::Color dim(Gdiplus::Color c, float k) {
                           (BYTE)(c.GetR() * k), (BYTE)(c.GetG() * k), (BYTE)(c.GetB() * k));
 }
 
-// 测量：布局 = pad + 名字 + 10 + 进度条76 + 6 + 百分比 + pad
+// 测量：布局 = pad + 名字 + gap + 进度条 + gap + 百分比 + pad（全部按 DPI 缩放）
 // 注意：Graphics 必须先于 DeleteDC 析构（内层作用域），否则析构触碰已释放 DC（UB）。
 static int measureWidth() {
     std::wstring name = utf8ToWide(g_vm.displayName);
@@ -133,7 +163,9 @@ static int measureWidth() {
     wchar_t pct[16];
     swprintf(pct, 16, L"%d%%", g_vm.percent);
 
-    int w = 160;
+    const float s = g_scale;
+    const float fontPx = metrics::kFontPx * s;
+    int w = (int)(metrics::kMinW * s);
     {
         HDC screen = GetDC(nullptr);
         HDC mem = CreateCompatibleDC(screen);
@@ -141,17 +173,22 @@ static int measureWidth() {
         {
             Gdiplus::Graphics gr(mem);
             gr.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-            Gdiplus::Font fName(L"Segoe UI", 9.5f);
-            Gdiplus::Font fPct(L"Segoe UI", 9.5f, Gdiplus::FontStyleBold);
+            // UnitPixel：直接用物理像素，避免 pt→px 的隐式 96 DPI 假设
+            Gdiplus::Font fName(L"Segoe UI", fontPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+            Gdiplus::Font fPct(L"Segoe UI", fontPx, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
             gr.MeasureString(name.c_str(), -1, &fName, Gdiplus::PointF(0, 0), &rn);
             gr.MeasureString(pct, -1, &fPct, Gdiplus::PointF(0, 0), &rp);
         } // gr 先析构
         DeleteDC(mem);
         ReleaseDC(nullptr, screen);
-        w = 12 + (int)rn.Width + 10 + 76 + 6 + (int)rp.Width + 12;
+        // 文字宽度已是物理像素，常量需乘 s
+        w = (int)(metrics::kPadX * s + rn.Width + metrics::kNameGap * s + metrics::kBarW * s +
+                  metrics::kBarGap * s + rp.Width + metrics::kPadX * s);
     }
-    if (w < 160) w = 160;
-    if (w > 420) w = 420; // 极端长名防溢出（名字另有 24 字符截断）
+    const int minW = (int)(metrics::kMinW * s);
+    const int maxW = (int)(metrics::kMaxW * s);
+    if (w < minW) w = minW;
+    if (w > maxW) w = maxW;
     return w;
 }
 
@@ -170,12 +207,16 @@ static void anchor() {
         RECT r{};
         if (GetWindowRect(tn, &r)) right = r.left;
     }
+    refreshDpiScale();   // 任务栏可能跨屏移动过，重新取当前显示器 DPI
+    const float s = g_scale;
     int taskH = tr.bottom - tr.top;
-    g_capsuleH = taskH - 16;
-    if (g_capsuleH < 24) g_capsuleH = 24;
-    if (g_capsuleH > 40) g_capsuleH = 40;
+    g_capsuleH = taskH - (int)(metrics::kTaskbarPad * s);
+    const int minH = (int)(metrics::kMinH * s);
+    const int maxH = (int)(metrics::kMaxH * s);
+    if (g_capsuleH < minH) g_capsuleH = minH;
+    if (g_capsuleH > maxH) g_capsuleH = maxH;
     g_y = tr.top + (taskH - g_capsuleH) / 2;
-    g_x = right - 8 - g_capsuleW;
+    g_x = right - (int)(metrics::kEdgeInset * s) - g_capsuleW;
     POINT p{g_x, g_y};
     if (ScreenToClient(g_tray, &p)) g_clientPos = p; // 子窗口用客户区坐标
 }
@@ -216,8 +257,6 @@ static void syncHitWindow(int W, int H) {
                  SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
 }
 
-static void syncHitWindow(int W, int H);
-
 // GDI+ 渲染 → 分层窗口呈现
 static void render() {
     const int W = g_capsuleW, H = g_capsuleH;
@@ -232,36 +271,43 @@ static void render() {
     gr.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
     gr.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
+    // DPI 缩放：所有尺寸乘 g_scale，保证 125%/150%/200% 下视觉一致
+    const float s = g_scale;
+    const float fontPx = metrics::kFontPx * s;
+    const float padX   = metrics::kPadX * s;
+    const float textH  = metrics::kTextH * s;
+
     // 背景完全透明（无底板/描边）——仅绘制文字与进度条，
     // 让胶囊下方任务栏图标透出；文字加白色描边保证图标底上可读。
-    Gdiplus::Font fName(L"Segoe UI", 9.5f);
-    Gdiplus::Font fPct(L"Segoe UI", 9.5f, Gdiplus::FontStyleBold);
+    Gdiplus::Font fName(L"Segoe UI", fontPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    Gdiplus::Font fPct(L"Segoe UI", fontPx, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     Gdiplus::SolidBrush textBr(Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
     Gdiplus::SolidBrush outlineBr(Gdiplus::Color(0xD0, 0xFF, 0xFF, 0xFF));
     Gdiplus::SolidBrush pctBr(g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xD7, 0x00, 0x15)
                                               : Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
 
-    float y = (H - 16.0f) / 2.0f;
-    float x = 12.0f;
+    float y = (H - textH) / 2.0f;
+    float x = padX;
 
     // 设备名（白色描边 + 正文）
     std::wstring name = utf8ToWide(g_vm.displayName);
     if (name.empty()) name = L"--";
     Gdiplus::RectF rn;
     gr.MeasureString(name.c_str(), -1, &fName, Gdiplus::PointF(0, 0), &rn);
-    gr.DrawString(name.c_str(), -1, &fName, Gdiplus::PointF(x + 1.0f, y + 1.0f), &outlineBr);
+    gr.DrawString(name.c_str(), -1, &fName, Gdiplus::PointF(x + s, y + s), &outlineBr);
     gr.DrawString(name.c_str(), -1, &fName, Gdiplus::PointF(x, y), &textBr);
-    x += rn.Width + 10.0f;
+    x += rn.Width + metrics::kNameGap * s;
 
     // 进度条：轨道 + 渐变填充（低电量红色）
-    const float barW = 76.0f, barH = 8.0f;
+    const float barW = metrics::kBarW * s, barH = metrics::kBarH * s;
     float barY = (H - barH) / 2.0f;
     Gdiplus::GraphicsPath track;
     roundRectPath(track, x, barY, barW, barH, barH / 2.0f);
     Gdiplus::SolidBrush trackBr(Gdiplus::Color(0x33, 0x00, 0x00, 0x00));
     gr.FillPath(&trackBr, &track);
     float fillW = barW * g_vm.percent / 100.0f;
-    if (g_vm.percent > 0 && fillW < 4.0f) fillW = 4.0f;
+    const float fillMin = 4.0f * s;
+    if (g_vm.percent > 0 && fillW < fillMin) fillW = fillMin;
     if (fillW > 1.0f) {
         // 充电呼吸：2s 一个周期，亮度 0.60 → 1.00（非充电恒为 1，视觉与旧版一致）
         float breath = 1.0f;
@@ -281,21 +327,21 @@ static void render() {
         gr.FillRectangle(&bar, x, barY, fillW, barH);
         gr.ResetClip();
     }
-    x += barW + 6.0f;
+    x += barW + metrics::kBarGap * s;
 
     // 百分比
     wchar_t pct[16];
     swprintf(pct, 16, L"%d%%", g_vm.percent);
     Gdiplus::RectF rp;
     gr.MeasureString(pct, -1, &fPct, Gdiplus::PointF(0, 0), &rp);
-    gr.DrawString(pct, -1, &fPct, Gdiplus::PointF(x + 1.0f, y + 1.0f), &outlineBr);
+    gr.DrawString(pct, -1, &fPct, Gdiplus::PointF(x + s, y + s), &outlineBr);
     gr.DrawString(pct, -1, &fPct, Gdiplus::PointF(x, y), &pctBr);
 
-    // 内容命中盒：盒外点击穿透到任务栏（透明像素不吞点击）
-    g_hitL = 12;
+    // 内容命中盒：盒外点击穿透到任务栏（透明像素不吞点击）——同样按 DPI 缩放
+    g_hitL = (int)padX;
     g_hitR = (int)(x + rp.Width);
     g_hitT = (int)y;
-    g_hitB = (int)y + 16;
+    g_hitB = (int)(y + textH);
 
     gr.Flush();
 
@@ -393,8 +439,6 @@ static void layout(bool force) {
     applyAnimTimer();
 }
 
-static void followTray() { layout(false); }
-
 static void sampleNow() {
     Snapshot s = adapters::ReadRegistrySnapshot();
     s.hostPresent = adapters::IsHostRunning();
@@ -404,12 +448,8 @@ static void sampleNow() {
     layout(true);
 }
 
-// 任务栏重建 / 子窗口被销毁 → 重建渲染窗并重新挂载。
-// 注意：任务栏子窗口会随旧任务栏一起销毁，句柄失效时必须重建，不能只 SetParent。
-// explorer 重启（任务栏重建）会连带销毁任务栏子窗口。
-// 实测：进程内重建的新子窗口 UpdateLayeredWindow 不出图（永远空白），
-// 因此改为「重启自己」——新进程走正常初始化流程，外观与首次启动一致。
-// 关键：旧进程必须真正退出（释放互斥并 PostQuitMessage），否则会出现双实例。
+// explorer 重启会连带销毁任务栏子窗口；实测进程内重建后 ULW 不出图（永远空白），
+// 故改为「重启自己」：新进程走正常初始化。旧进程必须真正退出并释放互斥，否则出现双实例。
 static void restartSelf() {
     wchar_t path[MAX_PATH]{};
     GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -486,7 +526,7 @@ static void CALLBACK onTrayEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG, LONG, DW
         g_tray = hwnd;
         // explorer 重启 → 任务栏子窗口已被连带销毁 → 重启自己（进程内重建无法出图）
         if (newTray) restartSelf();
-        followTray();
+        layout(false);
         return;
     }
 }
@@ -551,7 +591,7 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     } else if (!g_child) {
                         attachToTray();
                     }
-                    followTray();
+                    layout(false);
                     if (!g_child && IsWindowVisible(g_hwnd)) raiseTopmost();
                 }
             }
@@ -564,6 +604,11 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             EndPaint(hwnd, &ps);
             return 0; // 分层窗口由 UpdateLayeredWindow 呈现，无传统绘制
         }
+        case WM_DPICHANGED:
+            // 跨显示器拖动：DPI 变了 → 重算缩放、尺寸、位置并重绘
+            refreshDpiScale();
+            layout(true);
+            return 0;
         case WM_DESTROY:
             if (g_hitHwnd) { DestroyWindow(g_hitHwnd); g_hitHwnd = nullptr; }
             KillTimer(hwnd, IDT_POLL);
