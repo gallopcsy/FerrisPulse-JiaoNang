@@ -27,7 +27,8 @@ if ($LASTEXITCODE -ne 0) { Write-Error "tests FAILED ($LASTEXITCODE)"; exit $LAS
 
 # 2) 主程序（绿色单文件：静态链接、无控制台、裁剪符号）
 # 注意：g++ 走 ANSI 参数，直接输出中文文件名会乱码 → 先出 ASCII 名再改名。
-$srcs = @('src\ui\main.cpp', 'src\adapters\RegistryReader.cpp', 'src\adapters\Environment.cpp', 'src\core\CapsuleCore.cpp')
+$srcs = @('src\ui\main.cpp', 'src\adapters\RegistryReader.cpp', 'src\adapters\BluetoothBattery.cpp',
+          'src\adapters\Environment.cpp', 'src\core\CapsuleCore.cpp')
 $libs = @('-lgdiplus', '-lgdi32', '-lmsimg32', '-lshell32', '-ladvapi32', '-luser32', '-lole32')
 $tmpExe = 'bin\capsule.exe'
 $out = 'bin\设备任务栏胶囊.exe'

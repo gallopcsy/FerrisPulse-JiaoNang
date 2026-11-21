@@ -1,6 +1,7 @@
 // RegistryReader.cpp — HKCU\Software\RazerBatteryTray 只读遍历（绝不写入）
 // 键族结构与取值语义依据：SPEC「Implementation Decisions · 数据源」
 #include "RegistryReader.h"
+#include "BluetoothBattery.h"
 #include <windows.h>
 #include <functional>
 #include <string>
@@ -85,6 +86,25 @@ DeviceReading readDeviceValues(HKEY sub, const std::wstring& keyName, SourceTier
     return r;
 }
 
+// 蓝牙设备：优先读 Windows SetupAPI 的 BLE 电量（与「设置→蓝牙」同源，实时准确）。
+// 读不到（设备休眠/不在场/非 BLE）则保留注册表缓存值作为兜底。
+// 识别依据：DeviceId 以 "BT_" 开头，且 HardwareFingerprint 是 12 位十六进制 MAC。
+void preferBleBattery(HKEY sub, DeviceReading& r) {
+    if (r.deviceKey.rfind("BT_", 0) != 0) return;   // 非蓝牙设备：保持注册表值
+    std::wstring fp;
+    if (!readSz(sub, L"HardwareFingerprint", fp) || fp.empty()) return;
+    int pct = -1;
+    if (!ReadBleBattery(toUtf8(fp), pct)) return;   // 读不到 → 兜底
+    r.percent = pct;                                // 读到 → 覆盖注册表陈旧缓存
+    // 视为当前时刻（epoch 秒），便于同一设备多来源时的冲突消解
+    FILETIME ft{};
+    GetSystemTimeAsFileTime(&ft);
+    ULARGE_INTEGER u{};
+    u.LowPart = ft.dwLowDateTime;
+    u.HighPart = ft.dwHighDateTime;
+    r.timestamp = (long long)(u.QuadPart / 10000000ULL) - 11644473600LL;
+}
+
 // 单键品牌缓存：整键读成一条（后见设备语义，新旧由调用方/冲突消解处理）
 void readSingleKey(HKEY root, const wchar_t* path, const wchar_t* label,
                    const wchar_t* pctName, const wchar_t* chgName,
@@ -103,7 +123,9 @@ void readPerDeviceFamily(HKEY root, const wchar_t* path, SourceTier tier,
                          const wchar_t* timeName, const wchar_t* nameName,
                          bool requireValid, std::vector<DeviceReading>& out) {
     forEachSubkey(root, path, [&](HKEY sub, const std::wstring& key) {
-        out.push_back(readDeviceValues(sub, key, tier, pctName, chgName, timeName, nameName, requireValid));
+        DeviceReading r = readDeviceValues(sub, key, tier, pctName, chgName, timeName, nameName, requireValid);
+        preferBleBattery(sub, r);   // 蓝牙设备：BLE 实时值优先，注册表兜底
+        out.push_back(r);
     });
 }
 
