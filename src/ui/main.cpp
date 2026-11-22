@@ -54,7 +54,11 @@ static bool g_hover = false;    // 鼠标悬停在胶囊上（画一层淡淡的
 static HWND g_rebar = nullptr;
 // 内容命中盒（窗口内相对值）：盒外点击穿透到任务栏图标
 static int g_hitL = 0, g_hitR = 0, g_hitT = 0, g_hitB = 0;
-static HWINEVENTHOOK g_hookTray = nullptr;
+// 任务栏事件钩子。只订阅三类事件（SHOW / HIDE / LOCATIONCHANGE）：
+// 早期用 [EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE] 整个区间，
+// 区间内含 FOCUS / SELECTION / STATECHANGE 等组，会把全系统的这类事件
+// 都编组进本进程（OUTOFCONTEXT 跨进程投递），实测是 CPU 占用的主要来源。
+static HWINEVENTHOOK g_hooks[3] = {nullptr, nullptr, nullptr};
 
 // ── DPI 缩放 ───────────────────────────────────────────────────────
 // 进程是 PER_MONITOR_AWARE_V2：所有尺寸用物理像素。设计稿按 96 DPI(=100%) 绘制，
@@ -208,6 +212,15 @@ static int measureWidth() {
 
     const float s = g_scale;
     const float fontPx = metrics::kFontPx * s;
+
+    // 结果缓存：2s 心跳里绝大多数时刻文本并未变化，
+    // 避免每 tick 重复 GetDC/CreateDC/建 2 个 Font/MeasureString。
+    static std::wstring cName;
+    static int cPct = -999;
+    static float cScale = -1.0f;
+    static int cW = 0;
+    if (cW > 0 && cPct == g_vm.percent && cScale == s && cName == name) return cW;
+    cName = name; cPct = g_vm.percent; cScale = s;
     int w = (int)(metrics::kMinW * s);
     {
         HDC screen = GetDC(nullptr);
@@ -232,6 +245,7 @@ static int measureWidth() {
     const int maxW = (int)(metrics::kMaxW * s);
     if (w < minW) w = minW;
     if (w > maxW) w = maxW;
+    cW = w;
     return w;
 }
 
@@ -276,12 +290,13 @@ static void anchor() { anchorFor(g_main); }
 static void avoidRebarOnWin10() {
     refreshTray();
     if (!g_tray || !g_main.render) return;
-    // Win11 判据：任务栏里有 XAML 合成层桥（DesktopWindowContentBridge）。
-    // 注意 Win11 也可能残留 ReBarWindow32，因此不能靠 rebar 是否存在来判断系统版本。
-    if (FindWindowExW(g_tray, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr)) {
-        g_rebar = nullptr;
-        return;
-    }
+    // 平台判定只做一次（g_platform: 0=未知 1=Win11(XAML岛) 2=Win10(ReBar)）。
+    // 注意 Win11 也可能残留 ReBarWindow32，故不能靠 rebar 是否存在判版本。
+    static int g_platform = 0;
+    if (g_platform == 0)
+        g_platform = FindWindowExW(g_tray, nullptr, L"Windows.UI.Composition.DesktopWindowContentBridge", nullptr) ? 1 : 2;
+    if (g_platform == 1) { g_rebar = nullptr; return; }   // Win11：直接返回，无系统调用
+
     if (!g_rebar || !IsWindow(g_rebar))
         g_rebar = FindWindowExW(g_tray, nullptr, L"ReBarWindow32", nullptr);
     if (!g_rebar) return;
@@ -292,9 +307,12 @@ static void avoidRebarOnWin10() {
     POINT p{g_main.x, 0};
     if (!ScreenToClient(g_tray, &p)) return;
     const int wantW = p.x < 0 ? 0 : p.x;
-    if (wantW > 0 && wantW != rb.right)
+    static int g_rebarAppliedW = -1;
+    if (wantW > 0 && wantW != rb.right && wantW != g_rebarAppliedW) {
         SetWindowPos(g_rebar, nullptr, 0, 0, wantW, rb.bottom,
                      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        g_rebarAppliedW = wantW;
+    }
 }
 
 // 枚举所有「有托盘区」的水平副屏任务栏
@@ -350,20 +368,92 @@ static void syncHitFor(Capsule& c, int W, int H) {
 
 static void syncHitWindow(int W, int H) { syncHitFor(g_main, W, H); }
 
+// ── 渲染表面缓存（内存优化核心）───────────────────────────────────
+// 原实现每帧新建 Bitmap / 内存 DC / 2 个 Font / 4 个 Brush，并 GetHBITMAP 再复制一次。
+// 这里常驻一份 DIB section（32bpp、自上而下）+ 内存 DC + GDI+ Bitmap 包装，
+// 画刷与字体按字号缓存：仅尺寸或 DPI 变化时重建，稳态下每帧零堆分配。
+struct Surface {
+    int w = 0, h = 0;
+    HBITMAP dib = nullptr;
+    HDC dc = nullptr;
+    void* bits = nullptr;
+    Gdiplus::Bitmap* bmp = nullptr;
+    float fontPx = -1.0f;
+    Gdiplus::Font* fName = nullptr;
+    Gdiplus::Font* fPct = nullptr;
+    Gdiplus::SolidBrush* brText = nullptr;
+    Gdiplus::SolidBrush* brOutline = nullptr;
+    Gdiplus::SolidBrush* brPct = nullptr;
+    Gdiplus::SolidBrush* brPctLow = nullptr;
+};
+static Surface g_surf;
+
+static void releaseSurface() {
+    delete g_surf.bmp; g_surf.bmp = nullptr;
+    if (g_surf.dc) { DeleteDC(g_surf.dc); g_surf.dc = nullptr; }
+    if (g_surf.dib) { DeleteObject(g_surf.dib); g_surf.dib = nullptr; }
+    g_surf.bits = nullptr;
+    g_surf.w = g_surf.h = 0;
+}
+
+static void releaseFonts() {
+    delete g_surf.fName;  g_surf.fName = nullptr;
+    delete g_surf.fPct;   g_surf.fPct = nullptr;
+    delete g_surf.brText;    g_surf.brText = nullptr;
+    delete g_surf.brOutline; g_surf.brOutline = nullptr;
+    delete g_surf.brPct;     g_surf.brPct = nullptr;
+    delete g_surf.brPctLow;  g_surf.brPctLow = nullptr;
+    g_surf.fontPx = -1.0f;
+}
+
+static bool ensureFonts(float fontPx) {
+    if (g_surf.fontPx == fontPx && g_surf.fName) return true;
+    releaseFonts();
+    g_surf.fName = new Gdiplus::Font(L"Segoe UI", fontPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    g_surf.fPct  = new Gdiplus::Font(L"Segoe UI", fontPx, Gdiplus::FontStyleBold,    Gdiplus::UnitPixel);
+    if (g_surf.fName->GetLastStatus() != Gdiplus::Ok || g_surf.fPct->GetLastStatus() != Gdiplus::Ok) {
+        releaseFonts();
+        return false;
+    }
+    g_surf.brText    = new Gdiplus::SolidBrush(Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
+    g_surf.brOutline = new Gdiplus::SolidBrush(Gdiplus::Color(0xD0, 0xFF, 0xFF, 0xFF));
+    g_surf.brPct     = new Gdiplus::SolidBrush(Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
+    g_surf.brPctLow  = new Gdiplus::SolidBrush(Gdiplus::Color(0xFF, 0xD7, 0x00, 0x15));
+    g_surf.fontPx = fontPx;
+    return true;
+}
+
+static bool ensureSurface(int w, int h) {
+    if (g_surf.bmp && g_surf.w == w && g_surf.h == h) return true;
+    releaseSurface();
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;      // 负高度 = 自上而下，与 GDI+ 坐标一致
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib || !bits) { if (dib) DeleteObject(dib); return false; }
+    HDC dc = CreateCompatibleDC(nullptr);
+    if (!dc) { DeleteObject(dib); return false; }
+    SelectObject(dc, dib);
+    auto* bmp = new Gdiplus::Bitmap(w, h, w * 4, PixelFormat32bppPARGB, static_cast<BYTE*>(bits));
+    if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) {
+        delete bmp; DeleteDC(dc); DeleteObject(dib);
+        return false;
+    }
+    g_surf.dib = dib; g_surf.dc = dc; g_surf.bits = bits; g_surf.bmp = bmp;
+    g_surf.w = w; g_surf.h = h;
+    return true;
+}
+
 // GDI+ 渲染 → 分层窗口呈现
 static void renderFor(Capsule& c) {
     if (!c.render) return;
     const int W = g_capsuleW, H = g_capsuleH;
     if (W <= 0 || H <= 0) return;
-
-    // 关键：GDI+ 必须画在 Bitmap（PARGB）上 —— Graphics(HDC) 不写 alpha，
-    // 否则 UpdateLayeredWindow 按全透明合成（内容不可见）。
-    Gdiplus::Bitmap surface(W, H, PixelFormat32bppPARGB);
-    if (surface.GetLastStatus() != Gdiplus::Ok) return;
-    Gdiplus::Graphics gr(&surface);
-    gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    gr.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
-    gr.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
 
     // DPI 缩放：所有尺寸乘 g_scale，保证 125%/150%/200% 下视觉一致
     const float s = g_scale;
@@ -371,14 +461,23 @@ static void renderFor(Capsule& c) {
     const float padX   = metrics::kPadX * s;
     const float textH  = metrics::kTextH * s;
 
-    // 背景完全透明（无底板/描边）——仅绘制文字与进度条，
-    // 让胶囊下方任务栏图标透出；文字加白色描边保证图标底上可读。
-    Gdiplus::Font fName(L"Segoe UI", fontPx, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-    Gdiplus::Font fPct(L"Segoe UI", fontPx, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
-    Gdiplus::SolidBrush textBr(Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
-    Gdiplus::SolidBrush outlineBr(Gdiplus::Color(0xD0, 0xFF, 0xFF, 0xFF));
-    Gdiplus::SolidBrush pctBr(g_vm.lowBattery ? Gdiplus::Color(0xFF, 0xD7, 0x00, 0x15)
-                                              : Gdiplus::Color(0xE6, 0x20, 0x20, 0x20));
+    // 复用常驻表面与缓存画刷/字体（尺寸或 DPI 变化时才重建）
+    if (!ensureSurface(W, H) || !ensureFonts(fontPx)) return;
+    Gdiplus::Graphics gr(g_surf.bmp);
+    if (gr.GetLastStatus() != Gdiplus::Ok) return;
+    // 复用缓冲区：必须以 SourceCopy + 全透明清空，否则上一帧像素残留
+    gr.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
+    gr.Clear(Gdiplus::Color(0, 0, 0, 0));
+    gr.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+    gr.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    gr.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAlias);
+    gr.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+
+    Gdiplus::Font& fName = *g_surf.fName;
+    Gdiplus::Font& fPct  = *g_surf.fPct;
+    Gdiplus::SolidBrush& textBr    = *g_surf.brText;
+    Gdiplus::SolidBrush& outlineBr = *g_surf.brOutline;
+    Gdiplus::SolidBrush& pctBr     = g_vm.lowBattery ? *g_surf.brPctLow : *g_surf.brPct;
 
     // 悬停：画一层极淡的圆角底板，给出"可点击"的视觉反馈
     if (g_hover && &c == &g_main) {
@@ -448,11 +547,6 @@ static void renderFor(Capsule& c) {
 
     gr.Flush();
 
-    HBITMAP hBmp = nullptr;
-    if (surface.GetHBITMAP(Gdiplus::Color(0, 0, 0, 0), &hBmp) != Gdiplus::Ok || !hBmp) return;
-    HDC mem = CreateCompatibleDC(nullptr);
-    HGDIOBJ old = SelectObject(mem, hBmp);
-
     POINT ptSrc{0, 0};
     POINT ptDst{c.x, c.y};
     if (c.child) ptDst = c.clientPos;
@@ -461,11 +555,7 @@ static void renderFor(Capsule& c) {
     // 字段序：{BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat}
     // AlphaFormat 必须 = AC_SRC_ALPHA 才启用逐像素混合（否则整窗按不透明拷贝，透明区变纯黑）
     BLENDFUNCTION bf{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    UpdateLayeredWindow(c.render, nullptr, &ptDst, &sz, mem, &ptSrc, 0, &bf, ULW_ALPHA);
-
-    SelectObject(mem, old);
-    DeleteDC(mem);
-    DeleteObject(hBmp);
+    UpdateLayeredWindow(c.render, nullptr, &ptDst, &sz, g_surf.dc, &ptSrc, 0, &bf, ULW_ALPHA);
 }
 
 static void render() { renderFor(g_main); }
@@ -478,7 +568,13 @@ static void destroyMirror(Capsule& c) {
     c = Capsule{};
 }
 
+// 副屏枚举节流：枚举窗口是系统调用，没必要 2s 一次。
+// 默认每 5 个心跳（约 10s）重新枚举；显示器拓扑变化由 WM_DISPLAYCHANGE 立即触发。
+static bool g_resyncMirrors = true;
+static int g_mirrorTick = 0;
+
 static void syncMirrors(bool visible) {
+    const bool fullScan = g_resyncMirrors || (++g_mirrorTick % 5 == 0);
     if (!visible) {                      // 主屏不可见 → 全部镜像也隐藏
         for (auto& m : g_mirrors) {
             if (m.render && IsWindowVisible(m.render)) ShowWindow(m.render, SW_HIDE);
@@ -487,7 +583,9 @@ static void syncMirrors(bool visible) {
         return;
     }
 
-    const std::vector<HWND> bars = secondaryBars();
+    static std::vector<HWND> lastBars;
+    if (fullScan) { lastBars = secondaryBars(); g_resyncMirrors = false; }
+    const std::vector<HWND>& bars = lastBars;
 
     // 清理：任务栏消失 或 窗口没了
     for (auto it = g_mirrors.begin(); it != g_mirrors.end();) {
@@ -784,13 +882,20 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             refreshDpiScale();
             layout(true);
             return 0;
+        case WM_DISPLAYCHANGE:
+            // 显示器插拔/分辨率变化 → 立即重扫副屏任务栏，不等节流窗口
+            g_resyncMirrors = true;
+            g_mirrorTick = 4;          // 下一次 syncMirrors 即触发全量扫描
+            refreshDpiScale();
+            layout(true);
+            return 0;
         case WM_DESTROY:
             if (g_hitHwnd) { DestroyWindow(g_hitHwnd); g_hitHwnd = nullptr; }
             KillTimer(hwnd, IDT_POLL);
             KillTimer(hwnd, IDT_LIFE);
             KillTimer(hwnd, IDT_ANIM);
             g_animOn = false;
-            if (g_hookTray) { UnhookWinEvent(g_hookTray); g_hookTray = nullptr; }
+            for (auto& h : g_hooks) if (h) { UnhookWinEvent(h); h = nullptr; }
             PostQuitMessage(0);
             return 0;
     }
@@ -845,8 +950,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     // 任务栏显隐/滑入滑出/explorer 重启 → 立即跟随（2s LIFE 仅兜底）
     refreshTray();
-    g_hookTray = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_LOCATIONCHANGE,
-                                 nullptr, onTrayEvent, 0, 0, WINEVENT_OUTOFCONTEXT);
+    // 窄订阅 + 跳过本进程自身事件（我们自己也会 SetWindowPos，避免自激）
+    const DWORD hookFlags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+    g_hooks[0] = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW,
+                                 nullptr, onTrayEvent, 0, 0, hookFlags);
+    g_hooks[1] = SetWinEventHook(EVENT_OBJECT_HIDE, EVENT_OBJECT_HIDE,
+                                 nullptr, onTrayEvent, 0, 0, hookFlags);
+    g_hooks[2] = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE,
+                                 nullptr, onTrayEvent, 0, 0, hookFlags);
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
@@ -854,6 +965,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&m);
     }
 
+    // GDI+ 资源必须先于 GdiplusShutdown 释放（否则析构会触碰已关闭的 GDI+）
+    releaseSurface();
+    releaseFonts();
     if (g_mtx) { CloseHandle(g_mtx); g_mtx = nullptr; }
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     return 0;
